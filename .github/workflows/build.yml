@@ -46,7 +46,7 @@ jobs:
             "ndk;26.1.10909125" \
             "extras;android;m2repository" \
             "cmake;3.22.1" \
-            "lldb;14.0.6"
+            "lldb;14.0.5"
 
       - name: Clone AndroidIDE
         run: |
