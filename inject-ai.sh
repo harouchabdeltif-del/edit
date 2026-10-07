@@ -1113,5 +1113,6 @@ PY_EOF
 
 echo
 echo "✅ تمّ الحقن. دابا بني التطبيق:"
-echo "   cd $ROOT && ./gradlew :app:assembleDebug"
+rel="${APP#"$ROOT"/}"; GPATH=":${rel//\//:}"
+echo "   cd $ROOT && ./gradlew ${GPATH}:assembleDebug"
 echo "   (للتراجع: bash inject-ai.sh $ROOT undo)"
