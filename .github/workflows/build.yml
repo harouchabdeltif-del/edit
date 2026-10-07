@@ -10,10 +10,9 @@ defaults:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-
+    timeout-minutes: 120
     steps:
-      - name: Checkout repository
+      - name: Checkout (to get inject-ai.sh)
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -22,68 +21,50 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Android SDK command line tools
-        run: |
-          set -eux
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-            curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdline-tools.zip
-            unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
-            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-          fi
-
-      - name: Accept Android SDK licenses
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-
-      - name: Install required Android SDK packages
-        run: |
-          set -eux
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "platform-tools" \
-            "ndk;26.1.10909125" \
-            "extras;android;m2repository" \
-            "cmake;3.22.1" \
-        
-
+      # الريبو فيه submodule (logback-android) => لازم --recurse-submodules
+      # ما كنستعملوش --depth 1 حيث المشروع كيستعمل plugin Nyx اللي كيحتاج تاريخ git
       - name: Clone AndroidIDE
-        run: |
-          git clone https://github.com/AndroidIDEOfficial/AndroidIDE.git AndroidIDE
-
-      - name: Verify inject-ai.sh exists
-        run: |
-          test -f inject-ai.sh
-          chmod +x inject-ai.sh
-          ls -l inject-ai.sh
+        run: git clone --recurse-submodules https://github.com/AndroidIDEOfficial/AndroidIDE.git AndroidIDE
 
       - name: Inject AI assistant
         run: |
+          test -f inject-ai.sh || { echo "inject-ai.sh ماكاينش فجذر الريبو"; ls -la; exit 1; }
           bash inject-ai.sh AndroidIDE
+          echo "--- الملفات المعدّلة:"
+          git -C AndroidIDE status --short | head -20
 
-      - name: Fix tree-sitter / unavailable SNAPSHOT dependency
+      - name: Replace unavailable SNAPSHOT dependency with 4.0.1
         run: |
           cd AndroidIDE
-          find . -type f \( -name "*.toml" -o -name "*.kts" -o -name "*.gradle" -o -name "*.gradle.kts" \) \
-            ! -path "*/build/*" ! -path "*/.git/*" \
-            -exec sed -i \
-              -E 's/4\.0\.1-internal\.1[^"]*/4.0.1/g; s/4\.0\.1-internal\.1[^[:space:]]*/4.0.1/g' {} \;
+          grep -rl "4.0.1-internal.1" --include=*.toml --include=*.kts --include=*.kt --include=*.gradle --exclude-dir=build --exclude-dir=.git . | tee /dev/stderr | xargs -r sed -i -E 's/4\.0\.1-internal\.1[^"]*SNAPSHOT/4.0.1/g'
+
+      - name: Install Android SDK pieces
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('AndroidIDE/**/*.gradle*', 'AndroidIDE/**/gradle-wrapper.properties', 'AndroidIDE/**/libs.versions.toml') }}
+          restore-keys: gradle-${{ runner.os }}-
 
       - name: Build debug APK
         run: |
           cd AndroidIDE
           chmod +x gradlew
-          ./gradlew :app:assembleDebug \
-            --no-daemon \
-            --stacktrace 2>&1 | tee build.log
+          ./gradlew :core:app:assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
 
-      - name: Upload APK artifact
+      - name: Upload APKs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: androidide-ai-apk
-          path: AndroidIDE/app/build/outputs/apk/**/*.apk
+          path: AndroidIDE/core/app/build/outputs/apk/**/*.apk
           if-no-files-found: warn
 
       - name: Upload build log
