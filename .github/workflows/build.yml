@@ -36,7 +36,13 @@ jobs:
       - name: Replace unavailable SNAPSHOT dependency with 4.0.1
         run: |
           cd AndroidIDE
-          grep -rl "4.0.1-internal.1" --include=*.toml --include=*.kts --include=*.kt --include=*.gradle --exclude-dir=build --exclude-dir=.git . | tee /dev/stderr | xargs -r sed -i -E 's/4\.0\.1-internal\.1[^"]*SNAPSHOT/4.0.1/g'
+          files="$(grep -rl "4.0.1-internal.1" --include=*.toml --include=*.kts --include=*.kt --include=*.gradle --exclude-dir=build --exclude-dir=.git . || true)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            echo "$files" | xargs sed -i -E 's/4\.0\.1-internal\.1[^"]*SNAPSHOT/4.0.1/g'
+          else
+            echo "ما لقيتش dependency SNAPSHOT، نتخطّاو هاد الخطوة"
+          fi
 
       - name: Install Android SDK pieces
         run: |
