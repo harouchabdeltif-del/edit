@@ -33,16 +33,37 @@ jobs:
           echo "--- الملفات المعدّلة:"
           git -C AndroidIDE status --short | head -20
 
-      - name: Replace unavailable SNAPSHOT dependency with 4.0.1
+      # sora-editor 0.23.4-ce8de8e-SNAPSHOT ما بقاش منشور => نستعملو النسخة المستقرة 0.23.5
+      - name: Replace unavailable SNAPSHOT dependencies
         run: |
           cd AndroidIDE
-          files="$(grep -rl "4.0.1-internal.1" --include=*.toml --include=*.kts --include=*.kt --include=*.gradle --exclude-dir=build --exclude-dir=.git . || true)"
+          files="$(grep -rlE "0\.23\.4-ce8de8e-SNAPSHOT|4\.0\.1-internal\.1" --include=*.toml --include=*.kts --include=*.kt --include=*.gradle --exclude-dir=build --exclude-dir=.git . || true)"
           if [ -n "$files" ]; then
             echo "$files"
-            echo "$files" | xargs sed -i -E 's/4\.0\.1-internal\.1[^"]*SNAPSHOT/4.0.1/g'
+            echo "$files" | xargs sed -i -E \
+              -e 's/0\.23\.4-ce8de8e-SNAPSHOT/0.23.5/g' \
+              -e 's/4\.0\.1-internal\.1[^"]*SNAPSHOT/4.0.1/g'
           else
-            echo "ما لقيتش dependency SNAPSHOT، نتخطّاو هاد الخطوة"
+            echo "ما لقيتش dependencies SNAPSHOT، نتخطّاو"
           fi
+          echo "--- sora-editor version now:"
+          grep -rn "^editor = " gradle/libs.versions.toml || true
+
+      # jakarta.servlet-api كيتحل أحيانا لنسخة 6.2.0-M1 مكسورة => نثبّتو على 6.1.0
+      - name: Pin jakarta.servlet-api
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/pin-deps.gradle <<'EOF'
+          allprojects {
+            configurations.all {
+              resolutionStrategy.eachDependency { d ->
+                if (d.requested.group == 'jakarta.servlet' && d.requested.name == 'jakarta.servlet-api') {
+                  d.useVersion('6.1.0')
+                }
+              }
+            }
+          }
+          EOF
 
       - name: Install Android SDK pieces
         run: |
