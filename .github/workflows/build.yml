@@ -71,6 +71,19 @@ jobs:
           yes | "$SDKM" --licenses > /dev/null || true
           "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
 
+      # AGP كيفشل فإنشاء debug.keystore (تعارض BouncyCastle: xmss_SHAKE128_512ph)
+      # => نصاوبوه بـ keytool ديال JDK قبل البناء
+      - name: Create debug keystore
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -keystore ~/.android/debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          ls -la ~/.android
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -84,7 +97,17 @@ jobs:
         run: |
           cd AndroidIDE
           chmod +x gradlew
-          ./gradlew :core:app:assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+          ./gradlew :core:app:assembleDebug --no-daemon --console=plain 2>&1 | tee build.log
+
+      # ملخص قصير للخطأ فآخر الـ log (باش ما تحتاجش تسكرول فالهاتف)
+      - name: Show build errors
+        if: failure()
+        run: |
+          cd AndroidIDE
+          echo "===== What went wrong ====="
+          grep -n -A12 "What went wrong" build.log | head -60 || true
+          echo "===== Kotlin / Java / AAPT errors ====="
+          grep -nE "^e: |error: |AAPT" build.log | head -30 || true
 
       - name: Upload APKs
         if: always()
