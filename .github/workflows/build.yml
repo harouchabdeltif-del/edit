@@ -1,7 +1,12 @@
-name: Build AndroidIDE with AI assistant
+name: Build Zellige (AndroidIDE + AI assistant)
 
 on:
   workflow_dispatch:
+    inputs:
+      app_name:
+        description: "اسم التطبيق"
+        required: false
+        default: "Zellige"
 
 defaults:
   run:
@@ -12,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout (to get inject-ai.sh)
+      - name: Checkout (to get the Zellige kit)
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -26,12 +31,20 @@ jobs:
       - name: Clone AndroidIDE
         run: git clone --recurse-submodules https://github.com/AndroidIDEOfficial/AndroidIDE.git AndroidIDE
 
-      - name: Inject AI assistant
+      # الـ kit: إما zellige-all-in-one.sh (ملف واحد) أو مجلد zellige-kit/ فجذر الريبو
+      - name: Inject AI assistant + Zellige branding
+        env:
+          APP_NAME: ${{ inputs.app_name }}
         run: |
-          test -f inject-ai.sh || { echo "inject-ai.sh ماكاينش فجذر الريبو"; ls -la; exit 1; }
-          bash inject-ai.sh AndroidIDE
-          echo "--- الملفات المعدّلة:"
-          git -C AndroidIDE status --short | head -20
+          if   [ -f zellige-all-in-one.sh ];   then KIT="zellige-all-in-one.sh"
+          elif [ -f zellige-kit/zellige.sh ];  then KIT="zellige-kit/zellige.sh"
+          else echo "zellige-all-in-one.sh ماكاينش فجذر الريبو"; ls -la; exit 1; fi
+          bash "$KIT" AndroidIDE all --name "${APP_NAME:-Zellige}"
+          rm -rf AndroidIDE/.zellige   # الـ runner مؤقت: ما كنحتاجوش undo ولا النسخ الاحتياطية
+          echo "--- عدد الملفات المعدّلة/المضافة:"
+          git -C AndroidIDE status --short | wc -l
+          echo "--- الكود والإعدادات (بلا الأيقونات والنصوص):"
+          git -C AndroidIDE status --short | grep -v "/res/\|\.zellige" | head -20 || true
 
       # sora-editor 0.23.4-ce8de8e-SNAPSHOT ما بقاش منشور => نستعملو النسخة المستقرة 0.23.5
       - name: Replace unavailable SNAPSHOT dependencies
@@ -72,19 +85,32 @@ jobs:
           "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
 
       # AGP كيقلب على debug.keystore فـ ~/.config/.android (مماشي ~/.android)
-      # => نصاوبوه بصيغة JKS فجوج المسارات باش يتفادى تعارض BouncyCastle
-      - name: Create debug keystore
+      # => نحطو المفتاح فجوج المسارات (JKS باش يتفادى تعارض BouncyCastle).
+      # إلا كان zellige-debug.keystore فجذر الريبو كنستعملوه: نفس التوقيع فكل بناء،
+      # يعني الـ APK الجديد كيتثبّت فوق القديم بلا uninstall وبلا ما تضيع الـ SDK والـ JDK.
+      # بلا الملف: مفتاح عشوائي جديد فكل بناء (كل APK خاصو uninstall).
+      - name: Setup debug keystore
         run: |
           for d in "$HOME/.android" "$HOME/.config/.android"; do
             mkdir -p "$d"
             rm -f "$d/debug.keystore"
-            keytool -genkeypair -keystore "$d/debug.keystore" \
-              -storetype JKS \
-              -storepass android -keypass android -alias androiddebugkey \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
+            if [ -f zellige-debug.keystore ]; then
+              cp zellige-debug.keystore "$d/debug.keystore"
+            else
+              keytool -genkeypair -keystore "$d/debug.keystore" \
+                -storetype JKS \
+                -storepass android -keypass android -alias androiddebugkey \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
             ls -la "$d"
           done
+          if [ -f zellige-debug.keystore ]; then
+            echo "✅ توقيع ثابت: zellige-debug.keystore"
+            keytool -list -keystore zellige-debug.keystore -storepass android | grep -i "androiddebugkey\|Certificate fingerprint" || true
+          else
+            echo "⚠️ ما كاينش zellige-debug.keystore: توقيع عشوائي، كل APK جديد خاصو uninstall للقديم"
+          fi
 
       # مفتاح GPG ديال packages.androidide.com سالا => apt update كيفشل فأول تشغيل
       # => نزيدو [trusted=yes] فـ sources.list داخل bootstrap-*.zip
@@ -223,7 +249,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: androidide-ai-apk
+          name: zellige-apk
           path: AndroidIDE/core/app/build/outputs/apk/**/*.apk
           if-no-files-found: warn
 
