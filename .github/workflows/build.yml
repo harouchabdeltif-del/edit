@@ -86,6 +86,75 @@ jobs:
             ls -la "$d"
           done
 
+      # مفتاح GPG ديال packages.androidide.com سالا => apt update كيفشل فأول تشغيل
+      # => نزيدو [trusted=yes] فـ sources.list داخل bootstrap-*.zip قبل ما يتدمجو فالـ APK
+      - name: Prepare bootstrap patch (expired GPG key)
+        run: |
+          cat > ~/patch-bootstrap.py <<'EOF'
+          import os, re, sys, zipfile
+
+          root = sys.argv[1]
+          base = os.path.join(root, "termux")
+          if os.path.isdir(base):
+              root = base
+
+          def fix(text):
+              text = re.sub(r"^(deb(?:-src)?)[ \t]+(?!\[)", r"\1 [trusted=yes] ", text, flags=re.M)
+              text = re.sub(r"^(deb(?:-src)?[ \t]+\[)(?![^\]]*trusted=)", r"\1trusted=yes ", text, flags=re.M)
+              return text
+
+          def patch(path):
+              tmp = path + ".tmp"
+              changed = False
+              with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w") as zout:
+                  for item in zin.infolist():
+                      data = zin.read(item.filename)
+                      n = item.filename
+                      if n.startswith("etc/apt/") and n.endswith(".list"):
+                          old = data.decode("utf-8")
+                          new = fix(old)
+                          if new != old:
+                              data = new.encode("utf-8")
+                              changed = True
+                              print("  patched:", n)
+                      zout.writestr(item, data)
+              if changed:
+                  os.replace(tmp, path)
+              else:
+                  os.remove(tmp)
+              print(("PATCHED " if changed else "OK(no change) ") + path)
+
+          found = 0
+          for d, dirs, files in os.walk(root):
+              dirs[:] = [x for x in dirs if x not in (".git", "build", ".gradle")]
+              for f in files:
+                  if f.startswith("bootstrap-") and f.endswith(".zip"):
+                      found += 1
+                      patch(os.path.join(d, f))
+          print("bootstrap zips found:", found)
+          EOF
+
+          # Gradle init script: يعاود التصحيح بعد تحميل الـ bootstrap وقبل البناء native/assets
+          cat > ~/.gradle/init.d/patch-bootstrap.gradle <<'EOF'
+          allprojects {
+            tasks.configureEach { t ->
+              if (!t.project.path.contains('termux')) return
+              def n = t.name.toLowerCase()
+              def run = { ->
+                def pb = new ProcessBuilder('python3', System.getProperty('user.home') + '/patch-bootstrap.py', t.project.rootDir.absolutePath)
+                pb.inheritIO().start().waitFor()
+              }
+              if (n.contains('bootstrap')) {
+                t.doLast { run() }
+              } else if (n.startsWith('configurecmake') || n.startsWith('buildcmake') || n.startsWith('externalnativebuild') || n.contains('assets')) {
+                t.doFirst { run() }
+              }
+            }
+          }
+          EOF
+
+          python3 ~/patch-bootstrap.py AndroidIDE
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
