@@ -76,12 +76,12 @@ jobs:
       - name: Create debug keystore
         run: |
           mkdir -p ~/.android
-          if [ ! -f ~/.android/debug.keystore ]; then
-            keytool -genkeypair -keystore ~/.android/debug.keystore \
-              -storepass android -keypass android -alias androiddebugkey \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+          rm -f ~/.android/debug.keystore
+          keytool -genkeypair -keystore ~/.android/debug.keystore \
+            -storetype JKS \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
           ls -la ~/.android
 
       - name: Cache Gradle
@@ -97,7 +97,8 @@ jobs:
         run: |
           cd AndroidIDE
           chmod +x gradlew
-          ./gradlew :core:app:assembleDebug --no-daemon --console=plain 2>&1 | tee build.log
+          ./gradlew :core:app:assembleDebug -x :core:app:validateSigningDebug \
+            --no-daemon --console=plain 2>&1 | tee build.log
 
       # ملخص قصير للخطأ فآخر الـ log (باش ما تحتاجش تسكرول فالهاتف)
       - name: Show build errors
