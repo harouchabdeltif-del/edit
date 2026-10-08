@@ -331,14 +331,17 @@ import android.content.Context
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.util.TypedValue
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.BackgroundColorSpan
@@ -348,7 +351,9 @@ import android.text.style.TypefaceSpan
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.Window
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.EditText
@@ -372,16 +377,43 @@ object AiChat {
     private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 
     // ------------------------------------------------------------------ theme
-    private class Pal(val dark: Boolean) {
-        val bg = if (dark) Color.parseColor("#1C1B22") else Color.WHITE
-        val surface = if (dark) Color.parseColor("#2B2A33") else Color.parseColor("#F0EFF5")
-        val text = if (dark) Color.parseColor("#ECEBF2") else Color.parseColor("#1B1A20")
-        val sub = if (dark) Color.parseColor("#A09FAD") else Color.parseColor("#6C6B78")
-        val accent = Color.parseColor("#6200EE")
+    /**
+     * الألوان كتتجاب من theme ديال التطبيق نفسو (Material) باش المساعد يكون منسجم معاه 100%.
+     * إلا اختار المستخدم theme light/dark يدويا، كنستعملو ألوان احتياطية.
+     */
+    private class Pal(val dark: Boolean, private val a: Activity?, private val useApp: Boolean) {
+        private fun c(names: List<String>, fb: Int): Int {
+            if (a == null || !useApp) return fb
+            for (n in names) {
+                try {
+                    val id = a.resources.getIdentifier(n, "attr", a.packageName)
+                    if (id == 0) continue
+                    val tv = TypedValue()
+                    if (a.theme.resolveAttribute(id, tv, true) &&
+                        tv.type >= TypedValue.TYPE_FIRST_COLOR_INT && tv.type <= TypedValue.TYPE_LAST_COLOR_INT
+                    ) return tv.data
+                } catch (t: Throwable) { /* نجرب اسم آخر */ }
+            }
+            return fb
+        }
+
+        private fun hex(d: String, l: String) = Color.parseColor(if (dark) d else l)
+
+        val bg = c(listOf("colorSurfaceContainerHigh", "colorSurface"), hex("#1C1B22", "#FFFFFF"))
+        val surface = c(listOf("colorSurfaceContainerHighest", "colorSurfaceVariant"), hex("#2B2A33", "#F0EFF5"))
+        val text = c(listOf("colorOnSurface"), hex("#ECEBF2", "#1B1A20"))
+        val sub = c(listOf("colorOnSurfaceVariant"), hex("#A09FAD", "#6C6B78"))
+        val line = c(listOf("colorOutlineVariant", "colorOutline"), hex("#3A3946", "#D8D6E2"))
+        val accent = c(listOf("colorPrimary"), Color.parseColor("#6200EE"))
+        val onAccent = c(listOf("colorOnPrimary"), Color.WHITE)
+        val accentBox = c(listOf("colorPrimaryContainer"), hex("#3B2A7A", "#E6DEFF"))
+        val onAccentBox = c(listOf("colorOnPrimaryContainer"), hex("#EADDFF", "#21005D"))
+        val sec = c(listOf("colorSecondaryContainer"), hex("#2F3B63", "#DDE3FF"))
+        val onSec = c(listOf("colorOnSecondaryContainer"), hex("#DCE2FF", "#1A2550"))
         val danger = Color.parseColor("#C62828")
-        val codeBg = Color.parseColor("#14141A")
+        val codeBg = Color.parseColor("#0F1015")
         val codeText = Color.parseColor("#E4E4EE")
-        val inlineBg = if (dark) Color.parseColor("#3A3946") else Color.parseColor("#E2E0EC")
+        val inlineBg = line
     }
 
     private data class Seg(val isCode: Boolean, val text: String, val lang: String = "")
@@ -389,13 +421,19 @@ object AiChat {
     private fun pal(a: Activity): Pal {
         val night = (a.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
-        return Pal(
-            when (AiPrefs(a).theme) {
-                "dark" -> true
-                "light" -> false
-                else -> night
-            }
-        )
+        val theme = AiPrefs(a).theme
+        val dark = when (theme) {
+            "dark" -> true
+            "light" -> false
+            else -> night
+        }
+        return Pal(dark, a, theme == "auto")
+    }
+
+    /** ألوان الزر العائم: نفس ألوان أزرار التطبيق (secondary container). */
+    fun fabStyle(a: Activity): IntArray {
+        val p = pal(a)
+        return intArrayOf(p.sec, p.onSec)
     }
 
     // ------------------------------------------------------------------ view helpers
@@ -403,6 +441,10 @@ object AiChat {
 
     private fun shape(color: Int, radius: Float) = GradientDrawable().apply {
         setColor(color); cornerRadius = radius
+    }
+
+    private fun outlined(color: Int, radius: Float, line: Int, w: Int) = GradientDrawable().apply {
+        setColor(color); cornerRadius = radius; setStroke(w.coerceAtLeast(1), line)
     }
 
     private fun ripple(content: Drawable, radius: Float): Drawable =
@@ -423,7 +465,7 @@ object AiChat {
     }
 
     private fun pill(a: Activity, p: Pal, label: String, filled: Boolean = false, onClick: () -> Unit): TextView =
-        button(a, label, if (filled) Color.WHITE else p.text, if (filled) p.accent else p.surface, 13f, 14, 8, onClick)
+        button(a, label, if (filled) p.onAccent else p.onSec, if (filled) p.accent else p.sec, 13f, 14, 8, onClick)
 
     private fun weight() = LinearLayout.LayoutParams(0, WRAP, 1f)
 
@@ -506,8 +548,8 @@ object AiChat {
             try {
                 val cm = a.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cm.setPrimaryClip(ClipData.newPlainText("code", code))
-                toast("📋 تنسخ")
-            } catch (t: Throwable) { toast("⚠️ ${t.message}", true) }
+                toast("تم النسخ")
+            } catch (t: Throwable) { toast("تعذّر التنفيذ: ${t.message}", true) }
         }
 
         fun clip(): String? = try {
@@ -523,17 +565,17 @@ object AiChat {
         }
         val scroll = ScrollView(a).apply { addView(list); isVerticalScrollBarEnabled = false }
         val send = TextView(a).apply {
-            gravity = Gravity.CENTER; textSize = 18f; setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER; textSize = 20f; setTextColor(p.onAccent)
             background = ripple(shape(p.accent, dp(a, 22).toFloat()), dp(a, 22).toFloat())
             isClickable = true; isFocusable = true
         }
-        fun updateSend() { send.text = if (busy) "■" else "➤" }
+        fun updateSend() { send.text = if (busy) "■" else "↑" }
 
         // ---- تطبيق الكود على المحرر
         fun doInsert(code: String) {
             val ed = EditorAccess.find(a) ?: run { toast("ما كاين حتى ملف مفتوح"); return }
-            try { ed.replaceSelection(code); toast("✅ تم (Undo فالمحرر)") }
-            catch (t: Throwable) { toast("⚠️ ${t.message}", true) }
+            try { ed.replaceSelection(code); toast("تم التطبيق — يمكنك التراجع من المحرر") }
+            catch (t: Throwable) { toast("تعذّر التنفيذ: ${t.message}", true) }
         }
 
         fun doReplace(code: String) {
@@ -543,8 +585,8 @@ object AiChat {
                 .setTitle("استبدال الملف كامل؟")
                 .setMessage("${old.lines().size} سطر ← ${code.lines().size} سطر\n(تقدر دير Undo فالمحرر)")
                 .setPositiveButton("استبدل") { _, _ ->
-                    try { ed.replaceAll(code); toast("✅ تم (Undo فالمحرر)") }
-                    catch (t: Throwable) { toast("⚠️ ${t.message}", true) }
+                    try { ed.replaceAll(code); toast("تم التطبيق — يمكنك التراجع من المحرر") }
+                    catch (t: Throwable) { toast("تعذّر التنفيذ: ${t.message}", true) }
                 }
                 .setNegativeButton("إلغاء", null)
                 .show()
@@ -568,9 +610,9 @@ object AiChat {
                     LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) }
                 )
             }
-            mini("📋 نسخ") { copy(s.text) }
-            mini("📥 إدراج") { doInsert(s.text) }
-            mini("📄 استبدال") { doReplace(s.text) }
+            mini("نسخ") { copy(s.text) }
+            mini("إدراج") { doInsert(s.text) }
+            mini("استبدال") { doReplace(s.text) }
 
             val tv = TextView(a).apply {
                 text = s.text; setTextColor(p.codeText); textSize = 12f; typeface = Typeface.MONOSPACE
@@ -596,12 +638,12 @@ object AiChat {
             val mine = m.role == "user"
             val col = LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL
-                background = shape(if (mine) p.accent else p.surface, dp(a, 16).toFloat())
+                background = shape(if (mine) p.accentBox else p.surface, dp(a, 18).toFloat())
                 setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 8))
             }
             if (mine) {
                 col.addView(TextView(a).apply {
-                    text = m.content; setTextColor(Color.WHITE); textSize = 14f
+                    text = m.content; setTextColor(p.onAccentBox); textSize = 14f
                     setTextIsSelectable(true); textDirection = View.TEXT_DIRECTION_ANY_RTL
                 })
             } else {
@@ -630,7 +672,7 @@ object AiChat {
                 isIndeterminate = true; indeterminateTintList = ColorStateList.valueOf(p.accent)
             }, LinearLayout.LayoutParams(dp(a, 18), dp(a, 18)))
             addView(TextView(a).apply {
-                text = "كنفكر…"; setTextColor(p.sub); textSize = 13f; setPadding(dp(a, 8), 0, 0, 0)
+                text = "جارٍ التفكير…"; setTextColor(p.sub); textSize = 13f; setPadding(dp(a, 8), 0, 0, 0)
             })
             layoutParams = itemParams(true).apply { marginStart = 0; gravity = Gravity.START }
         }
@@ -645,13 +687,13 @@ object AiChat {
         fun render() {
             list.removeAllViews()
             if (AiPlugin.history.isEmpty() && !busy) {
-                list.addView(notice("اكتب أمرك أو اختار اقتراح من لتحت 👇\nمثال: زيد زر تسجيل الدخول فهاد الملف", p.sub))
+                list.addView(notice("كيف يمكنني مساعدتك؟\nاكتب طلبك أو اختر أحد الاقتراحات أدناه.\nمثال: أضف زر تسجيل الدخول في هذا الملف", p.sub))
             }
             AiPlugin.history.forEach { list.addView(bubble(it)) }
             if (busy) list.addView(thinking())
             lastError?.let { e ->
                 list.addView(TextView(a).apply {
-                    text = "⚠️ $e"; setTextColor(Color.WHITE); textSize = 13f
+                    text = "تعذّر إتمام الطلب\n$e"; setTextColor(Color.WHITE); textSize = 13f
                     setTextIsSelectable(true)
                     background = shape(p.danger, dp(a, 12).toFloat())
                     setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 8))
@@ -703,37 +745,46 @@ object AiChat {
         val header = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val titles = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
         titles.addView(TextView(a).apply {
-            text = "✨ مساعد الذكاء الاصطناعي"; setTextColor(p.text); textSize = 16f; typeface = Typeface.DEFAULT_BOLD
+            text = "مساعد الذكاء الاصطناعي"; setTextColor(p.text); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
         })
         titles.addView(TextView(a).apply {
             text = prefs.provider + " · " + prefs.effectiveModel().ifBlank { "—" }
             setTextColor(p.sub); textSize = 11f; setSingleLine(); textDirection = View.TEXT_DIRECTION_LTR
         })
+        val avatar = TextView(a).apply {
+            text = "AI"; setTextColor(p.onAccentBox); textSize = 13f; typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(p.accentBox) }
+        }
+        header.addView(avatar, LinearLayout.LayoutParams(dp(a, 36), dp(a, 36)).apply { marginEnd = dp(a, 10) })
         header.addView(titles, weight())
-        header.addView(pill(a, p, "⚙️") { showSettings(a) })
-        header.addView(pill(a, p, "🗑") {
+        header.addView(pill(a, p, "الإعدادات") { showSettings(a) })
+        header.addView(pill(a, p, "مسح") {
             cancel(); AiPlugin.history.clear(); lastError = null; AiPlugin.save(a); render()
         }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) })
-        header.addView(pill(a, p, "✖") { dialog.dismiss() },
+        header.addView(pill(a, p, "✕") { dialog.dismiss() },
             LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) })
 
         // ---- اقتراحات سريعة
         val chipsRow = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
         fun chip(label: String, onClick: () -> Unit) {
-            chipsRow.addView(pill(a, p, label) { onClick() },
+            chipsRow.addView(button(a, label, p.text, Color.TRANSPARENT, 13f, 14, 8) { onClick() }.apply {
+                val r = dp(a, 18).toFloat()
+                background = ripple(outlined(Color.TRANSPARENT, r, p.line, dp(a, 1)), r)
+            },
                 LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = dp(a, 6) })
         }
-        chip("🛠 أصلح الملف") {
+        chip("أصلح الملف") {
             ask("أصلح الأخطاء فهاد الملف وعطيني الملف كامل مصحّح فبلوك كود واحد، مع شرح قصير للأخطاء.")
         }
-        chip("📖 اشرح الملف") { ask("اشرح ليا هاد الملف باختصار.") }
-        chip("🔎 اشرح التحديد") { ask("اشرح ليا الجزء المحدد فقط (Selected text) بالتفصيل.") }
-        chip("♻️ حسّن الكود") {
+        chip("اشرح الملف") { ask("اشرح ليا هاد الملف باختصار.") }
+        chip("اشرح التحديد") { ask("اشرح ليا الجزء المحدد فقط (Selected text) بالتفصيل.") }
+        chip("حسّن الكود") {
             ask("حسّن جودة وقراءة الكود (التحديد إن وُجد، وإلا الملف) بلا ما تبدّل السلوك، وعطيني النتيجة فبلوك كود واحد.")
         }
-        chip("🧪 اختبارات") { ask("كتب ليا اختبارات (unit tests) مناسبة للكود المحدد أو للملف الحالي.") }
-        chip("📝 تعليقات") { ask("زيد تعليقات وتوثيق KDoc/Javadoc واضح للكود، وعطيني الملف كامل فبلوك كود واحد.") }
-        chip("🩺 حلّل خطأ من الحافظة") {
+        chip("اختبارات") { ask("كتب ليا اختبارات (unit tests) مناسبة للكود المحدد أو للملف الحالي.") }
+        chip("تعليقات") { ask("زيد تعليقات وتوثيق KDoc/Javadoc واضح للكود، وعطيني الملف كامل فبلوك كود واحد.") }
+        chip("حلّل خطأ من الحافظة") {
             val c = clip()
             if (c == null) toast("الحافظة فارغة — انسخ اللوغ أولا")
             else ask("حلّل هاد الخطأ/اللوغ وقلّي السبب والحل:\n```\n${c.take(6000)}\n```")
@@ -744,8 +795,8 @@ object AiChat {
 
         // ---- الإدخال
         val input = EditText(a).apply {
-            hint = "اكتب أمرك…"; setTextColor(p.text); setHintTextColor(p.sub)
-            background = shape(p.surface, dp(a, 22).toFloat())
+            hint = "اكتب رسالتك…"; setTextColor(p.text); setHintTextColor(p.sub)
+            background = shape(p.surface, dp(a, 24).toFloat())
             setPadding(dp(a, 14), dp(a, 10), dp(a, 14), dp(a, 10))
             maxLines = 4
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -762,8 +813,8 @@ object AiChat {
         // ---- التجميع
         val root = LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(a, 12), dp(a, 12), dp(a, 12), dp(a, 12))
-            background = shape(p.bg, dp(a, 20).toFloat())
+            setPadding(dp(a, 16), dp(a, 16), dp(a, 16), dp(a, 16))
+            background = shape(p.bg, dp(a, 28).toFloat())
         }
         root.addView(header)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f).apply { topMargin = dp(a, 8) })
@@ -777,10 +828,58 @@ object AiChat {
             setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         }
         dialog.show()
-        dialog.window?.setLayout(
-            (a.resources.displayMetrics.widthPixels * 0.95).toInt(),
-            (a.resources.displayMetrics.heightPixels * 0.88).toInt()
-        )
+
+        // ---- الكيبورد: نحسبو المساحة المرئية ونكيّفو الحوار معاها باش خانة الكتابة تبقى فوق الكيبورد
+        val dm = a.resources.displayMetrics
+        var lastKey = ""
+        var kbWasOpen = false
+        fun fit() {
+            val win = dialog.window ?: return
+            val r = Rect()
+            root.getWindowVisibleDisplayFrame(r)
+            var full = dm.heightPixels
+            var bottom = r.bottom
+            if (Build.VERSION.SDK_INT >= 30) {
+                try {
+                    full = a.windowManager.currentWindowMetrics.bounds.height()
+                    val ins = root.rootWindowInsets
+                    if (ins != null && ins.isVisible(WindowInsets.Type.ime())) {
+                        bottom = minOf(bottom, full - ins.getInsets(WindowInsets.Type.ime()).bottom)
+                    }
+                } catch (t: Throwable) { /* نكمّلو بالحساب العادي */ }
+            }
+            val kbOpen = full - bottom > full * 0.15f
+            val maxH = (dm.heightPixels * 0.88f).toInt()
+            val gap = dp(a, 8)
+            val h = if (kbOpen) minOf(maxH, bottom - r.top - 2 * gap) else maxH
+            val y = if (kbOpen) r.top + gap else 0
+            val g = if (kbOpen) (Gravity.TOP or Gravity.CENTER_HORIZONTAL) else Gravity.CENTER
+            val w = (dm.widthPixels * 0.95f).toInt()
+            val key = "$w/$h/$y/$g"
+            if (key != lastKey) {
+                lastKey = key
+                val lp = win.attributes
+                lp.width = w; lp.height = h; lp.gravity = g; lp.x = 0; lp.y = y
+                win.attributes = lp
+            }
+            if (kbOpen != kbWasOpen) {
+                kbWasOpen = kbOpen
+                scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+            }
+        }
+        val gl = ViewTreeObserver.OnGlobalLayoutListener { fit() }
+        val decor = a.window.decorView
+        root.viewTreeObserver.addOnGlobalLayoutListener(gl)
+        decor.viewTreeObserver.addOnGlobalLayoutListener(gl)
+        root.setOnApplyWindowInsetsListener { v, ins -> v.post { fit() }; v.onApplyWindowInsets(ins) }
+        fun refit() { for (t in longArrayOf(120L, 300L, 600L)) root.postDelayed({ fit() }, t) }
+        input.setOnFocusChangeListener { _, f -> if (f) refit() }
+        input.setOnClickListener { refit() }
+        dialog.setOnDismissListener {
+            try { root.viewTreeObserver.removeOnGlobalLayoutListener(gl) } catch (t: Throwable) { }
+            try { decor.viewTreeObserver.removeOnGlobalLayoutListener(gl) } catch (t: Throwable) { }
+        }
+        fit()
     }
 
     // -------------------------------------------------------------- settings
@@ -820,7 +919,7 @@ object AiChat {
             background = shape(p.bg, dp(a, 20).toFloat())
         }
         box.addView(TextView(a).apply {
-            text = "⚙️ إعدادات AI"; setTextColor(p.text); textSize = 16f; typeface = Typeface.DEFAULT_BOLD
+            text = "إعدادات المساعد"; setTextColor(p.text); textSize = 16f; typeface = Typeface.DEFAULT_BOLD
         })
         box.addView(label("المزوّد")); box.addView(provider)
         box.addView(label("الموديل")); box.addView(model)
@@ -829,16 +928,16 @@ object AiChat {
         box.addView(label("المظهر")); box.addView(theme)
 
         val row = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(pill(a, p, "🔌 اختبار") {
+        row.addView(pill(a, p, "اختبار الاتصال") {
             save()
             Toast.makeText(a, "⏳ كنجرب الاتصال…", Toast.LENGTH_SHORT).show()
             Thread {
-                val msg = try { AiClient.ping(prefs); "✅ الاتصال شغال" }
-                catch (t: Throwable) { "⚠️ ${t.message ?: t.javaClass.simpleName}" }
+                val msg = try { AiClient.ping(prefs); "الاتصال ناجح" }
+                catch (t: Throwable) { "فشل الاتصال: ${t.message ?: t.javaClass.simpleName}" }
                 a.runOnUiThread { Toast.makeText(a, msg, Toast.LENGTH_LONG).show() }
             }.start()
         }, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginEnd = dp(a, 8) })
-        row.addView(pill(a, p, "💾 حفظ", filled = true) {
+        row.addView(pill(a, p, "حفظ", filled = true) {
             save()
             Toast.makeText(a, "تم الحفظ", Toast.LENGTH_SHORT).show()
             dialog.dismiss()
@@ -980,17 +1079,14 @@ object AiPlugin {
         val content = a.findViewById<ViewGroup>(android.R.id.content) ?: return
         if (content.findViewWithTag<View>("ai_fab") != null) return
         val d = a.resources.displayMetrics.density
+        val st = AiChat.fabStyle(a)
         val fab = TextView(a).apply {
-            tag = "ai_fab"; text = "AI"; setTextColor(Color.WHITE); textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER; elevation = 10 * d
-            alpha = 0.92f
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                intArrayOf(Color.parseColor("#8E5CFF"), Color.parseColor("#6200EE"))
-            ).apply { shape = GradientDrawable.OVAL }
+            tag = "ai_fab"; text = "AI"; setTextColor(st[1]); textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER; elevation = 6 * d
+            background = GradientDrawable().apply { setColor(st[0]); cornerRadius = 16 * d }
         }
-        val size = (54 * d).toInt()
-        val lp = FrameLayout.LayoutParams(size, size, Gravity.BOTTOM or Gravity.END)
+        val size = (56 * d).toInt()
+        val lp = FrameLayout.LayoutParams(size, size, Gravity.BOTTOM or Gravity.RIGHT)
             .apply { setMargins(0, 0, (16 * d).toInt(), (110 * d).toInt()) }
         content.addView(fab, lp)
 
@@ -1036,6 +1132,28 @@ object AiPlugin {
     }
 }
 KT_EOF
+
+# ---------------------------------------------------------------- إزالة LeakCanary (تطبيق "Leaks")
+echo "🧹 كنقلّب على LeakCanary..."
+LC_USES="$(grep -rIl -i 'leakcanary' "$ROOT" --include='*.kt' --include='*.java' --include='*.xml' \
+  --exclude-dir=build --exclude-dir=.git --exclude-dir=.gradle 2>/dev/null \
+  | grep -v '/src/debug/res/values/leakcanary_config.xml' || true)"
+LC_BLD="$(grep -rIl -i 'leakcanary' "$ROOT" --include='*.kts' --include='*.gradle' --include='*.toml' \
+  --exclude-dir=build --exclude-dir=.git --exclude-dir=.gradle 2>/dev/null || true)"
+if [ -z "$LC_USES" ] && [ -n "$LC_BLD" ]; then
+  for f in $LC_BLD; do
+    [ -f "$f.ai-bak" ] || cp "$f" "$f.ai-bak"
+    sed -i '/leakcanary/Id' "$f"
+    echo "🗑️  حيّدت LeakCanary من $f"
+  done
+else
+  if [ -n "$LC_USES" ]; then
+    echo "⚠️ LeakCanary مستعمل فالكود، غنخبّي الأيقونة فقط:"; echo "$LC_USES"
+  fi
+  LCD="$APP/src/debug/res/values"; mkdir -p "$LCD"
+  printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<resources>' \
+    '    <bool name="leak_canary_add_launcher_icon">false</bool>' '</resources>' > "$LCD/leakcanary_config.xml"
+fi
 
 # ---------------------------------------------------------------- patch Application + Manifest
 python3 - "$ROOT" "$NEW_APPID" <<'PY_EOF'
