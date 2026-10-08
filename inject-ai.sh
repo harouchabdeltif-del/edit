@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# inject-ai.sh — يحقن مساعد الذكاء الاصطناعي مباشرة داخل تطبيق AndroidIDE الرئيسي
+# inject-ai.sh — يحقن وكيل الذكاء الاصطناعي (Agent) مباشرة داخل تطبيق AndroidIDE الرئيسي
 # الاستخدام:   bash inject-ai.sh /path/to/AndroidIDE
 # مع pkg جديد: bash inject-ai.sh /path/to/AndroidIDE inject com.mycompany.androidide.ai
 # للتراجع:     bash inject-ai.sh /path/to/AndroidIDE undo
@@ -38,6 +38,7 @@ PKG_DIR="$APP/src/main/java/com/itsaky/androidide/ai"
 # ---------------------------------------------------------------- undo
 if [ "$ACTION" = "undo" ]; then
   rm -rf "$PKG_DIR"
+  rm -f "$APP"/src/main/res/drawable/ic_ai_*.xml "$APP/src/main/res/raw/ai_keep.xml"
   find "$APP" -name '*.ai-bak' -not -path '*/build/*' | while read -r b; do
     mv -f "$b" "${b%.ai-bak}"; echo "↩️  رجّعت ${b%.ai-bak}"
   done
@@ -80,6 +81,11 @@ class AiPrefs(ctx: Context) {
     var history: String
         get() = sp.getString("history", "") ?: ""
         set(v) { sp.edit().putString("history", v).apply() }
+
+    /** true = يطلب تأكيدا قبل كل كتابة/تعديل. الحذف دائما يطلب تأكيدا. */
+    var askBeforeEdit: Boolean
+        get() = sp.getBoolean("ask_before_edit", false)
+        set(v) { sp.edit().putBoolean("ask_before_edit", v).apply() }
 
     fun effectiveModel(): String = model.ifBlank {
         when (provider) {
@@ -161,7 +167,7 @@ object AiClient {
         msgs.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
         val body = JSONObject()
             .put("model", p.effectiveModel())
-            .put("max_tokens", 8192)
+            .put("max_tokens", 12000)
             .put("system", system)
             .put("messages", arr)
         val res = JSONObject(
@@ -214,7 +220,7 @@ object AiClient {
         try {
             c.requestMethod = "POST"
             c.connectTimeout = 20_000
-            c.readTimeout = 120_000
+            c.readTimeout = 300_000
             c.doOutput = true
             c.setRequestProperty("Content-Type", "application/json")
             headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
@@ -318,69 +324,383 @@ class EditorAccess private constructor(private val v: View) {
 }
 KT_EOF
 
+# ---------------------------------------------------------------- AiAgent.kt
+cat > "$PKG_DIR/AiAgent.kt" <<'KT_EOF'
+package com.itsaky.androidide.ai
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.os.Environment
+import android.os.Looper
+import java.io.File
+import java.util.concurrent.CountDownLatch
+
+/**
+ * منفّذ الأدوات: النموذج يرسل وسوم <tool .../> والوكيل ينفّذها (قراءة/كتابة/تعديل/إنشاء/حذف/نقل/بحث)
+ * داخل مجلد العمل فقط، مع إمكانية التراجع عن آخر تنفيذ.
+ */
+object AiAgent {
+
+    data class Call(val name: String, val attrs: Map<String, String>, val body: String) {
+        val path: String get() = attrs["path"].orEmpty()
+    }
+
+    data class StepResult(val call: Call, val ok: Boolean, val text: String)
+
+    class Denied : RuntimeException()
+
+    class Run { val undo = mutableListOf<Pair<File, String?>>() }
+
+    /** مجلد العمل: كل المسارات لازم تكون داخله أو داخل مجلد مشاريع AndroidIDE. */
+    class Workspace(val root: File, val projects: File) {
+        fun resolve(p: String): File {
+            val t = p.trim().ifEmpty { "." }
+            val f = if (t.startsWith("/")) File(t) else File(root, t)
+            val c = f.canonicalFile
+            val ok = listOf(root, projects).any {
+                val r = it.canonicalFile
+                c == r || c.path.startsWith(r.path + File.separator)
+            }
+            if (!ok) throw SecurityException("المسار خارج مجلد العمل: $p")
+            return c
+        }
+
+        fun rel(f: File): String {
+            val r = root.canonicalFile.path
+            return if (f.path.startsWith(r + File.separator)) f.path.substring(r.length + 1) else f.path
+        }
+    }
+
+    fun projectsDir(): File = File(Environment.getExternalStorageDirectory(), "AndroidIDEProjects")
+
+    // ------------------------------------------------------------------ parsing
+    private val toolRe = Regex("<tool\\s+([^>]*?)\\s*(?:/>|>([\\s\\S]*?)</tool>)")
+    private val attrRe = Regex("(\\w+)=\"([^\"]*)\"")
+    private val editRe = Regex("<find>([\\s\\S]*?)</find>\\s*<replace>([\\s\\S]*?)</replace>")
+    private val resultRe = Regex("<result ok=\"(true|false)\" label=\"([^\"]*)\">\\r?\\n([\\s\\S]*?)\\r?\\n</result>")
+
+    private fun trimNl(s: String) =
+        s.removePrefix("\r\n").removePrefix("\n").removeSuffix("\r\n").removeSuffix("\n")
+
+    fun parse(reply: String): List<Call> = toolRe.findAll(reply).map { m ->
+        val attrs = attrRe.findAll(m.groupValues[1]).associate { it.groupValues[1] to it.groupValues[2] }
+        Call(attrs["name"].orEmpty(), attrs, trimNl(m.groupValues[2]))
+    }.toList()
+
+    fun strip(reply: String): String = toolRe.replace(reply, "").trim()
+
+    /** يقصّ محتوى الملفات الكبيرة فالرسائل القديمة باش السياق ما يتضخمش. */
+    fun compact(m: AiClient.Msg): AiClient.Msg {
+        if (m.role == "assistant" && m.content.contains("<tool")) {
+            val c = toolRe.replace(m.content) { r ->
+                val body = r.groupValues[2]
+                if (body.length > 300) "<tool " + r.groupValues[1] + ">\n[content omitted]\n</tool>" else r.value
+            }
+            return AiClient.Msg(m.role, c)
+        }
+        if (isResults(m) && m.content.length > 1500) return AiClient.Msg(m.role, m.content.take(1500) + "\n[…]\n</tool_results>")
+        return m
+    }
+
+    fun isResults(m: AiClient.Msg) = m.role == "user" && m.content.startsWith("<tool_results>")
+
+    fun parseResults(content: String): List<Triple<Boolean, String, String>> =
+        resultRe.findAll(content).map {
+            Triple(it.groupValues[1] == "true", it.groupValues[2], it.groupValues[3].lineSequence().firstOrNull().orEmpty())
+        }.toList()
+
+    fun describe(c: Call): String {
+        val p = c.path.ifBlank { "." }
+        return when (c.name) {
+            "write_file" -> "كتابة $p"
+            "edit_file" -> "تعديل $p"
+            "read_file" -> "قراءة $p"
+            "list_dir" -> "عرض المجلد $p"
+            "create_dir" -> "إنشاء المجلد $p"
+            "delete" -> "حذف $p"
+            "move" -> "نقل $p"
+            "search" -> "بحث «${c.attrs["query"].orEmpty()}»"
+            else -> c.name
+        }
+    }
+
+    fun formatResults(rs: List<StepResult>): String = buildString {
+        appendLine("<tool_results>")
+        rs.forEach { r ->
+            appendLine("<result ok=\"${r.ok}\" label=\"${describe(r.call).replace('"', '\'')}\">")
+            appendLine(r.text)
+            appendLine("</result>")
+        }
+        append("</tool_results>")
+    }
+
+    // ------------------------------------------------------------------ undo
+    private val stack = ArrayDeque<List<Pair<File, String?>>>()
+
+    fun end(r: Run) {
+        if (r.undo.isEmpty()) return
+        synchronized(stack) {
+            stack.addLast(r.undo.toList())
+            while (stack.size > 10) stack.removeFirst()
+        }
+    }
+
+    /** يجب استدعاؤها من الـ UI thread. */
+    fun undoLast(a: Activity): String {
+        val last = synchronized(stack) { stack.removeLastOrNull() } ?: return "لا يوجد تنفيذ سابق للتراجع عنه"
+        var n = 0
+        for ((f, old) in last.asReversed()) {
+            try {
+                if (old == null) f.delete() else put(a, f, old)
+                n++
+            } catch (t: Throwable) { /* نكمّل الباقي */ }
+        }
+        return "تم التراجع عن $n ملف"
+    }
+
+    private fun remember(run: Run, f: File, old: String?) {
+        if (run.undo.none { it.first == f }) run.undo.add(f to old)
+    }
+
+    // ------------------------------------------------------------------ UI-thread helpers
+    private fun <T> onUi(a: Activity, f: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return f()
+        val latch = CountDownLatch(1)
+        var res: Result<T>? = null
+        a.runOnUiThread { res = runCatching(f); latch.countDown() }
+        latch.await()
+        return res!!.getOrThrow()
+    }
+
+    private fun confirm(a: Activity, title: String, msg: String): Boolean {
+        val latch = CountDownLatch(1)
+        var yes = false
+        a.runOnUiThread {
+            AlertDialog.Builder(a).setTitle(title).setMessage(msg)
+                .setPositiveButton("تنفيذ") { _, _ -> yes = true; latch.countDown() }
+                .setNegativeButton("رفض") { _, _ -> latch.countDown() }
+                .setOnCancelListener { latch.countDown() }
+                .show()
+        }
+        latch.await()
+        return yes
+    }
+
+    private fun guard(a: Activity, ask: Boolean, title: String, what: String) {
+        if (ask && !confirm(a, title, what)) throw Denied()
+    }
+
+    private fun sameFile(ed: EditorAccess, f: File): Boolean =
+        try { ed.file()?.canonicalFile == f.canonicalFile } catch (t: Throwable) { false }
+
+    /** يكتب على القرص، ولو الملف مفتوح فالمحرر يحدّثه هو كذلك. */
+    private fun put(a: Activity, f: File, text: String) {
+        f.parentFile?.mkdirs()
+        f.writeText(text)
+        onUi(a) {
+            val ed = EditorAccess.find(a)
+            if (ed != null && sameFile(ed, f)) ed.replaceAll(text)
+        }
+    }
+
+    /** النص الحالي: من المحرر إن كان الملف مفتوحا (قد يحتوي تعديلات غير محفوظة)، وإلا من القرص. */
+    private fun current(a: Activity, f: File): String? {
+        val fromEditor: String? = onUi(a) {
+            val ed = EditorAccess.find(a)
+            if (ed != null && sameFile(ed, f)) ed.allText() else null
+        }
+        if (fromEditor != null) return fromEditor
+        if (!f.isFile) return null
+        require(f.length() <= 2_000_000) { "الملف كبير جدا" }
+        return f.readText()
+    }
+
+    private fun cap(s: String) = if (s.length > 12000) s.take(12000) + "\n…[تم الاقتطاع]" else s
+
+    // ------------------------------------------------------------------ tools
+    fun execute(a: Activity, run: Run, ws: Workspace, c: Call, ask: Boolean): StepResult =
+        try {
+            StepResult(c, true, cap(dispatch(a, run, ws, c, ask)))
+        } catch (d: Denied) {
+            StepResult(c, false, "رفض المستخدم هذا الإجراء. لا تكرّره؛ اسأله ماذا يريد.")
+        } catch (t: Throwable) {
+            StepResult(c, false, t.message ?: t.javaClass.simpleName)
+        }
+
+    private val skipDirs = setOf("build", ".gradle", ".git", ".idea", ".cxx", ".kotlin", "node_modules")
+    private val binExt = setOf(
+        "png", "jpg", "jpeg", "webp", "gif", "jar", "aar", "apk", "so", "zip",
+        "ttf", "otf", "mp3", "mp4", "class", "dex", "keystore", "jks"
+    )
+
+    private fun dispatch(a: Activity, run: Run, ws: Workspace, c: Call, ask: Boolean): String = when (c.name) {
+
+        "list_dir" -> {
+            val d = ws.resolve(c.path)
+            if (!d.isDirectory) throw IllegalArgumentException("ليس مجلدا: ${c.path}")
+            val items = d.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })) ?: emptyList()
+            if (items.isEmpty()) "(فارغ)"
+            else items.take(300).joinToString("\n") { if (it.isDirectory) it.name + "/" else it.name }
+        }
+
+        "read_file" -> {
+            val f = ws.resolve(c.path)
+            current(a, f) ?: throw IllegalArgumentException("الملف غير موجود: ${c.path}")
+        }
+
+        "write_file" -> {
+            val f = ws.resolve(c.path)
+            require(!f.isDirectory) { "هذا مجلد وليس ملفا: ${c.path}" }
+            val old = current(a, f)
+            guard(a, ask, "كتابة ملف", ws.rel(f))
+            remember(run, f, old)
+            put(a, f, c.body)
+            (if (old == null) "تم إنشاء " else "تم تحديث ") + ws.rel(f) + " (" + c.body.lines().size + " سطر)"
+        }
+
+        "edit_file" -> {
+            val f = ws.resolve(c.path)
+            val orig = current(a, f) ?: throw IllegalArgumentException("الملف غير موجود: ${c.path}")
+            val edits = editRe.findAll(c.body).toList()
+            require(edits.isNotEmpty()) { "edit_file يحتاج <find> و <replace>" }
+            var text = orig
+            for ((i, m) in edits.withIndex()) {
+                val find = trimNl(m.groupValues[1])
+                val rep = trimNl(m.groupValues[2])
+                require(find.isNotEmpty()) { "تعديل رقم ${i + 1}: <find> فارغ" }
+                val first = text.indexOf(find)
+                require(first >= 0) { "تعديل رقم ${i + 1}: النص غير موجود بالضبط فالملف — اقرأ الملف من جديد وانسخ النص حرفيا" }
+                require(text.indexOf(find, first + 1) < 0) { "تعديل رقم ${i + 1}: النص يتكرر أكثر من مرة — زد سياقا أكثر" }
+                text = text.substring(0, first) + rep + text.substring(first + find.length)
+            }
+            guard(a, ask, "تعديل ملف", ws.rel(f))
+            remember(run, f, orig)
+            put(a, f, text)
+            "تم تعديل " + ws.rel(f) + " (" + edits.size + " تعديل)"
+        }
+
+        "create_dir" -> {
+            val d = ws.resolve(c.path)
+            guard(a, ask, "إنشاء مجلد", ws.rel(d))
+            if (d.isDirectory || d.mkdirs()) "تم إنشاء " + ws.rel(d) else throw IllegalStateException("تعذّر إنشاء المجلد")
+        }
+
+        "delete" -> {
+            val f = ws.resolve(c.path)
+            require(f.exists()) { "غير موجود: ${c.path}" }
+            require(f != ws.root.canonicalFile && f != ws.projects.canonicalFile) { "لا يمكن حذف مجلد العمل نفسه" }
+            if (!confirm(a, "حذف", ws.rel(f))) throw Denied()
+            if (f.isFile && f.length() < 1_000_000) remember(run, f, try { f.readText() } catch (t: Throwable) { null })
+            if (f.deleteRecursively()) "تم حذف " + ws.rel(f) else throw IllegalStateException("تعذّر الحذف")
+        }
+
+        "move" -> {
+            val src = ws.resolve(c.path)
+            val dst = ws.resolve(c.attrs["to"].orEmpty())
+            require(src.exists()) { "غير موجود: ${c.path}" }
+            require(!dst.exists()) { "الوجهة موجودة مسبقا" }
+            guard(a, ask, "نقل", ws.rel(src) + "\n← " + ws.rel(dst))
+            dst.parentFile?.mkdirs()
+            if (!src.renameTo(dst)) {
+                src.copyRecursively(dst)
+                src.deleteRecursively()
+            }
+            "تم النقل إلى " + ws.rel(dst)
+        }
+
+        "search" -> {
+            val q = c.attrs["query"].orEmpty()
+            require(q.isNotBlank()) { "query مطلوب" }
+            val base = ws.resolve(c.path.ifBlank { "." })
+            val out = mutableListOf<String>()
+            fun walk(f: File) {
+                if (out.size >= 60) return
+                if (f.isDirectory) {
+                    if (f.name in skipDirs) return
+                    f.listFiles()?.forEach { walk(it) }
+                } else if (f.extension.lowercase() !in binExt && f.length() < 500_000) {
+                    try {
+                        f.useLines { lines ->
+                            lines.forEachIndexed { i, l ->
+                                if (out.size < 60 && l.contains(q, ignoreCase = true)) out.add(ws.rel(f) + ":" + (i + 1) + ": " + l.trim().take(200))
+                            }
+                        }
+                    } catch (t: Throwable) { /* ملف غير نصي */ }
+                }
+            }
+            walk(base)
+            if (out.isEmpty()) "لا نتائج" else out.joinToString("\n")
+        }
+
+        else -> throw IllegalArgumentException("أداة غير معروفة: ${c.name}")
+    }
+}
+
+KT_EOF
+
 # ---------------------------------------------------------------- AiChat.kt
 cat > "$PKG_DIR/AiChat.kt" <<'KT_EOF'
 package com.itsaky.androidide.ai
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.app.Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
-import android.graphics.Rect
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
-import android.util.TypedValue
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.BackgroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.ViewTreeObserver
-import android.view.Window
-import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import com.google.android.material.bottomsheet.BottomSheetBehavior
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.chip.Chip
 import java.io.File
 
 object AiChat {
 
     private val ui = Handler(Looper.getMainLooper())
-    private var busy = false
-    private var reqId = 0
-    private var lastError: String? = null
+    @Volatile private var busy = false
+    @Volatile private var reqId = 0
+    @Volatile private var lastError: String? = null
+    private var onChange: (() -> Unit)? = null
 
     private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
     private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+    private const val MAX_STEPS = 20
+
+    private fun notifyChange() { ui.post { onChange?.invoke() } }
 
     // ------------------------------------------------------------------ theme
-    /**
-     * الألوان كتتجاب من theme ديال التطبيق نفسو (Material) باش المساعد يكون منسجم معاه 100%.
-     * إلا اختار المستخدم theme light/dark يدويا، كنستعملو ألوان احتياطية.
-     */
+    /** الألوان كتتجاب من theme ديال التطبيق نفسو (Material) باش المساعد يكون منسجم معاه 100%. */
     private class Pal(val dark: Boolean, private val a: Activity?, private val useApp: Boolean) {
         private fun c(names: List<String>, fb: Int): Int {
             if (a == null || !useApp) return fb
@@ -408,9 +728,8 @@ object AiChat {
         val onAccent = c(listOf("colorOnPrimary"), Color.WHITE)
         val accentBox = c(listOf("colorPrimaryContainer"), hex("#3B2A7A", "#E6DEFF"))
         val onAccentBox = c(listOf("colorOnPrimaryContainer"), hex("#EADDFF", "#21005D"))
-        val sec = c(listOf("colorSecondaryContainer"), hex("#2F3B63", "#DDE3FF"))
-        val onSec = c(listOf("colorOnSecondaryContainer"), hex("#DCE2FF", "#1A2550"))
-        val danger = Color.parseColor("#C62828")
+        val danger = c(listOf("colorError"), Color.parseColor("#C62828"))
+        val onDanger = c(listOf("colorOnError"), Color.WHITE)
         val codeBg = Color.parseColor("#0F1015")
         val codeText = Color.parseColor("#E4E4EE")
         val inlineBg = line
@@ -430,10 +749,19 @@ object AiChat {
         return Pal(dark, a, theme == "auto")
     }
 
-    /** ألوان الزر العائم: نفس ألوان أزرار التطبيق (secondary container). */
+    /** ألوان الزر العائم: نفس ألوان FAB ديال Material 3 (primary container). */
     fun fabStyle(a: Activity): IntArray {
         val p = pal(a)
-        return intArrayOf(p.sec, p.onSec)
+        return intArrayOf(p.accentBox, p.onAccentBox)
+    }
+
+    /** أيقونات vector كيصاوبها السكريبت فـ res/drawable. */
+    fun icon(a: Activity, name: String): Drawable? {
+        for (pkg in listOf(a.packageName, "com.itsaky.androidide")) {
+            val id = a.resources.getIdentifier(name, "drawable", pkg)
+            if (id != 0) return a.getDrawable(id)?.mutate()
+        }
+        return null
     }
 
     // ------------------------------------------------------------------ view helpers
@@ -450,24 +778,40 @@ object AiChat {
     private fun ripple(content: Drawable, radius: Float): Drawable =
         RippleDrawable(ColorStateList.valueOf(Color.argb(70, 150, 150, 160)), content, shape(Color.WHITE, radius))
 
-    private fun button(
-        a: Activity, label: String, fg: Int, bgc: Int, size: Float, padH: Int, padV: Int, onClick: () -> Unit
-    ): TextView {
-        val r = dp(a, 18).toFloat()
-        return TextView(a).apply {
-            text = label; textSize = size; gravity = Gravity.CENTER
-            setTextColor(fg)
-            setPadding(dp(a, padH), dp(a, padV), dp(a, padH), dp(a, padV))
-            background = ripple(shape(bgc, r), r)
+    private fun iconButton(
+        a: Activity, name: String, desc: String, fg: Int, bgc: Int, sizeDp: Int, onClick: () -> Unit
+    ): ImageView {
+        val oval = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(bgc) }
+        val mask = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.WHITE) }
+        return ImageView(a).apply {
+            setImageDrawable(icon(a, name))
+            imageTintList = ColorStateList.valueOf(fg)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            val pad = dp(a, sizeDp) * 28 / 100
+            setPadding(pad, pad, pad, pad)
+            background = RippleDrawable(ColorStateList.valueOf(Color.argb(60, 150, 150, 160)), oval, mask)
+            contentDescription = desc
             isClickable = true; isFocusable = true
             setOnClickListener { onClick() }
         }
     }
 
-    private fun pill(a: Activity, p: Pal, label: String, filled: Boolean = false, onClick: () -> Unit): TextView =
-        button(a, label, if (filled) p.onAccent else p.onSec, if (filled) p.accent else p.sec, 13f, 14, 8, onClick)
-
-    private fun weight() = LinearLayout.LayoutParams(0, WRAP, 1f)
+    private fun materialButton(a: Activity, p: Pal, label: String, filled: Boolean, onClick: () -> Unit): MaterialButton =
+        MaterialButton(a).apply {
+            text = label
+            setAllCaps(false)
+            cornerRadius = dp(a, 20)
+            if (filled) {
+                backgroundTintList = ColorStateList.valueOf(p.accent)
+                setTextColor(p.onAccent)
+            } else {
+                backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+                setTextColor(p.accent)
+                strokeWidth = dp(a, 1)
+                strokeColor = ColorStateList.valueOf(p.line)
+            }
+            setOnClickListener { onClick() }
+        }
 
     private fun spinner(a: Activity, p: Pal, items: List<String>, selected: String): Spinner {
         val ad = object : ArrayAdapter<String>(a, android.R.layout.simple_spinner_dropdown_item, items) {
@@ -480,6 +824,28 @@ object AiChat {
             adapter = ad
             setSelection(items.indexOf(selected).coerceAtLeast(0))
         }
+    }
+
+    /** يضبط BottomSheetDialog: يتمدد لأعلى الشاشة، بلا حالة مطوية، والخلفية ديال المحتوى هي اللي كتبان. */
+    private fun setupSheet(a: Activity, dialog: BottomSheetDialog, content: View, topOffsetDp: Int) {
+        dialog.setContentView(content)
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        (content.parent as? View)?.let { sheet ->
+            sheet.setBackgroundColor(Color.TRANSPARENT)
+            sheet.layoutParams.height = MATCH
+        }
+        dialog.behavior.apply {
+            skipCollapsed = true
+            isFitToContents = false
+            expandedOffset = dp(a, topOffsetDp)
+            state = BottomSheetBehavior.STATE_EXPANDED
+        }
+    }
+
+    private fun sheetBackground(a: Activity, p: Pal) = GradientDrawable().apply {
+        setColor(p.bg)
+        val r = dp(a, 28).toFloat()
+        cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
     }
 
     // ------------------------------------------------------------------ markdown (خفيف)
@@ -534,12 +900,11 @@ object AiChat {
         return sb
     }
 
-    // ------------------------------------------------------------------ chat
+    // ------------------------------------------------------------------ chat sheet
     fun show(a: Activity) {
         val prefs = AiPrefs(a)
         val p = pal(a)
-        val dialog = Dialog(a)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val dialog = BottomSheetDialog(a)
 
         fun toast(s: String, long: Boolean = false) =
             Toast.makeText(a, s, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
@@ -564,12 +929,11 @@ object AiChat {
             setPadding(0, dp(a, 4), 0, dp(a, 4))
         }
         val scroll = ScrollView(a).apply { addView(list); isVerticalScrollBarEnabled = false }
-        val send = TextView(a).apply {
-            gravity = Gravity.CENTER; textSize = 20f; setTextColor(p.onAccent)
-            background = ripple(shape(p.accent, dp(a, 22).toFloat()), dp(a, 22).toFloat())
-            isClickable = true; isFocusable = true
+        val send = iconButton(a, "ic_ai_send", "إرسال", p.onAccent, p.accent, 44) { }
+        fun updateSend() {
+            send.setImageDrawable(icon(a, if (busy) "ic_ai_stop" else "ic_ai_send"))
+            send.contentDescription = if (busy) "إيقاف" else "إرسال"
         }
-        fun updateSend() { send.text = if (busy) "■" else "↑" }
 
         // ---- تطبيق الكود على المحرر
         fun doInsert(code: String) {
@@ -596,19 +960,21 @@ object AiChat {
         fun codeView(s: Seg): View {
             val box = LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL
-                background = shape(p.codeBg, dp(a, 10).toFloat())
-                setPadding(dp(a, 8), dp(a, 6), dp(a, 8), dp(a, 8))
+                background = shape(p.codeBg, dp(a, 12).toFloat())
+                setPadding(dp(a, 10), dp(a, 6), dp(a, 10), dp(a, 8))
             }
             val bar = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
             bar.addView(TextView(a).apply {
                 text = s.lang.ifBlank { "code" }; setTextColor(Color.parseColor("#8A8A9A")); textSize = 11f
-            }, weight())
-            val tone = Color.parseColor("#2A2A34")
+            }, LinearLayout.LayoutParams(0, WRAP, 1f))
             fun mini(label: String, f: () -> Unit) {
-                bar.addView(
-                    button(a, label, p.codeText, tone, 11f, 10, 5, f),
-                    LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) }
-                )
+                bar.addView(TextView(a).apply {
+                    text = label; textSize = 11f; setTextColor(p.codeText); gravity = Gravity.CENTER
+                    setPadding(dp(a, 10), dp(a, 5), dp(a, 10), dp(a, 5))
+                    background = ripple(shape(Color.parseColor("#2A2A34"), dp(a, 14).toFloat()), dp(a, 14).toFloat())
+                    isClickable = true; isFocusable = true
+                    setOnClickListener { f() }
+                }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) })
             }
             mini("نسخ") { copy(s.text) }
             mini("إدراج") { doInsert(s.text) }
@@ -634,8 +1000,31 @@ object AiChat {
             if (mine) { marginStart = dp(a, 40) } else { marginEnd = dp(a, 16) }
         }
 
-        fun bubble(m: AiClient.Msg): View {
+        /** بطاقة نشاط الوكيل: كل أداة نفّذها (✓ نجحت / ✗ فشلت). */
+        fun activity(m: AiClient.Msg): View {
+            val col = LinearLayout(a).apply {
+                orientation = LinearLayout.VERTICAL
+                background = outlined(Color.TRANSPARENT, dp(a, 14).toFloat(), p.line, dp(a, 1))
+                setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 8))
+            }
+            AiAgent.parseResults(m.content).forEach { (ok, label, detail) ->
+                col.addView(TextView(a).apply {
+                    text = (if (ok) "✓  " else "✗  ") + label + (if (!ok && detail.isNotBlank()) "\n    " + detail.take(160) else "")
+                    textSize = 12.5f
+                    setTextColor(if (ok) p.sub else p.danger)
+                    textDirection = View.TEXT_DIRECTION_ANY_RTL
+                    setPadding(0, dp(a, 2), 0, dp(a, 2))
+                })
+            }
+            col.layoutParams = itemParams(false)
+            return col
+        }
+
+        fun bubble(m: AiClient.Msg): View? {
+            if (AiAgent.isResults(m)) return if (AiAgent.parseResults(m.content).isEmpty()) null else activity(m)
             val mine = m.role == "user"
+            val body = if (mine) m.content else AiAgent.strip(m.content)
+            if (body.isBlank()) return null
             val col = LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL
                 background = shape(if (mine) p.accentBox else p.surface, dp(a, 18).toFloat())
@@ -643,11 +1032,11 @@ object AiChat {
             }
             if (mine) {
                 col.addView(TextView(a).apply {
-                    text = m.content; setTextColor(p.onAccentBox); textSize = 14f
+                    text = body; setTextColor(p.onAccentBox); textSize = 14f
                     setTextIsSelectable(true); textDirection = View.TEXT_DIRECTION_ANY_RTL
                 })
             } else {
-                for (s in parse(m.content)) {
+                for (s in parse(body)) {
                     if (s.isCode) {
                         col.addView(codeView(s), LinearLayout.LayoutParams(MATCH, WRAP).apply {
                             topMargin = dp(a, 4); bottomMargin = dp(a, 4)
@@ -664,7 +1053,7 @@ object AiChat {
             return col
         }
 
-        fun thinking(): View = LinearLayout(a).apply {
+        fun working(): View = LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             background = shape(p.surface, dp(a, 16).toFloat())
             setPadding(dp(a, 14), dp(a, 10), dp(a, 14), dp(a, 10))
@@ -672,13 +1061,13 @@ object AiChat {
                 isIndeterminate = true; indeterminateTintList = ColorStateList.valueOf(p.accent)
             }, LinearLayout.LayoutParams(dp(a, 18), dp(a, 18)))
             addView(TextView(a).apply {
-                text = "جارٍ التفكير…"; setTextColor(p.sub); textSize = 13f; setPadding(dp(a, 8), 0, 0, 0)
+                text = "جارٍ العمل…"; setTextColor(p.sub); textSize = 13f; setPadding(dp(a, 8), 0, 0, 0)
             })
-            layoutParams = itemParams(true).apply { marginStart = 0; gravity = Gravity.START }
+            layoutParams = itemParams(false).apply { marginEnd = 0 }
         }
 
-        fun notice(text: String, color: Int): View = TextView(a).apply {
-            this.text = text; setTextColor(color); textSize = 13f; gravity = Gravity.CENTER
+        fun notice(text: String): View = TextView(a).apply {
+            this.text = text; setTextColor(p.sub); textSize = 13f; gravity = Gravity.CENTER
             textDirection = View.TEXT_DIRECTION_ANY_RTL
             setPadding(dp(a, 12), dp(a, 24), dp(a, 12), dp(a, 24))
             layoutParams = LinearLayout.LayoutParams(MATCH, WRAP)
@@ -687,15 +1076,15 @@ object AiChat {
         fun render() {
             list.removeAllViews()
             if (AiPlugin.history.isEmpty() && !busy) {
-                list.addView(notice("كيف يمكنني مساعدتك؟\nاكتب طلبك أو اختر أحد الاقتراحات أدناه.\nمثال: أضف زر تسجيل الدخول في هذا الملف", p.sub))
+                list.addView(notice("أنا وكيل برمجي: أعطني أمرا وأنا أنفّذه.\nمثال: أنشئ مشروع أندرويد جديد باسم Notes مع شاشة رئيسية\nأو: أضف زر تسجيل الدخول في هذا الملف"))
             }
-            AiPlugin.history.forEach { list.addView(bubble(it)) }
-            if (busy) list.addView(thinking())
+            AiPlugin.history.forEach { m -> bubble(m)?.let { list.addView(it) } }
+            if (busy) list.addView(working())
             lastError?.let { e ->
                 list.addView(TextView(a).apply {
-                    text = "تعذّر إتمام الطلب\n$e"; setTextColor(Color.WHITE); textSize = 13f
+                    text = "تعذّر إتمام الطلب\n$e"; setTextColor(p.onDanger); textSize = 13f
                     setTextIsSelectable(true)
-                    background = shape(p.danger, dp(a, 12).toFloat())
+                    background = shape(p.danger, dp(a, 14).toFloat())
                     setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 8))
                     layoutParams = itemParams(false)
                 })
@@ -703,40 +1092,17 @@ object AiChat {
             scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
         }
 
-        // ---- الإرسال
+        // ---- الإرسال / الإيقاف
         fun ask(prompt: String) {
             if (busy) return
             if (prefs.apiKey.isBlank()) { toast("ضع مفتاح API أولا", true); showSettings(a); return }
-            lastError = null
-            val ed = EditorAccess.find(a)
-            val earlier = AiPlugin.history.takeLast(10)
-            AiPlugin.history.add(AiClient.Msg("user", prompt))
-            val req = earlier + AiClient.Msg("user", buildPrompt(prompt, ed))
-            val system = buildSystem(ed)
-            val my = ++reqId
-            busy = true; updateSend(); render()
-            Thread {
-                var reply: String? = null
-                var err: String? = null
-                try { reply = AiClient.complete(prefs, system, req) } catch (t: Throwable) { err = t.message ?: t.javaClass.simpleName }
-                ui.post {
-                    if (my != reqId) return@post   // الطلب تلغى
-                    busy = false; updateSend()
-                    if (reply != null) {
-                        AiPlugin.history.add(AiClient.Msg("assistant", reply))
-                    } else {
-                        if (AiPlugin.history.lastOrNull()?.role == "user") AiPlugin.history.removeAt(AiPlugin.history.lastIndex)
-                        lastError = err
-                    }
-                    AiPlugin.save(a)
-                    render()
-                }
-            }.start()
+            startRun(a, prompt)
         }
 
         fun cancel() {
             reqId++; busy = false
-            if (AiPlugin.history.lastOrNull()?.role == "user") AiPlugin.history.removeAt(AiPlugin.history.lastIndex)
+            val last = AiPlugin.history.lastOrNull()
+            if (last != null && last.role == "user" && !AiAgent.isResults(last)) AiPlugin.history.removeAt(AiPlugin.history.lastIndex)
             AiPlugin.save(a)
             updateSend(); render()
         }
@@ -751,56 +1117,62 @@ object AiChat {
             text = prefs.provider + " · " + prefs.effectiveModel().ifBlank { "—" }
             setTextColor(p.sub); textSize = 11f; setSingleLine(); textDirection = View.TEXT_DIRECTION_LTR
         })
-        val avatar = TextView(a).apply {
-            text = "AI"; setTextColor(p.onAccentBox); textSize = 13f; typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(p.accentBox) }
+        val avatar = iconButton(a, "ic_ai_sparkle", "", p.onAccentBox, p.accentBox, 40) { }
+        avatar.isClickable = false
+        val more = iconButton(a, "ic_ai_more", "المزيد", p.sub, Color.TRANSPARENT, 40) { }
+        more.setOnClickListener { v ->
+            val pm = PopupMenu(a, v)
+            pm.menu.add(0, 1, 0, "الإعدادات")
+            pm.menu.add(0, 2, 1, "محادثة جديدة")
+            pm.menu.add(0, 3, 2, "تراجع عن آخر تنفيذ")
+            pm.setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    1 -> showSettings(a)
+                    2 -> { cancel(); AiPlugin.history.clear(); lastError = null; AiPlugin.save(a); render() }
+                    3 -> toast(AiAgent.undoLast(a), true)
+                }
+                true
+            }
+            pm.show()
         }
-        header.addView(avatar, LinearLayout.LayoutParams(dp(a, 36), dp(a, 36)).apply { marginEnd = dp(a, 10) })
-        header.addView(titles, weight())
-        header.addView(pill(a, p, "الإعدادات") { showSettings(a) })
-        header.addView(pill(a, p, "مسح") {
-            cancel(); AiPlugin.history.clear(); lastError = null; AiPlugin.save(a); render()
-        }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) })
-        header.addView(pill(a, p, "✕") { dialog.dismiss() },
-            LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) })
+        val close = iconButton(a, "ic_ai_close", "إغلاق", p.sub, Color.TRANSPARENT, 40) { dialog.dismiss() }
+        header.addView(avatar, LinearLayout.LayoutParams(dp(a, 40), dp(a, 40)).apply { marginEnd = dp(a, 12) })
+        header.addView(titles, LinearLayout.LayoutParams(0, WRAP, 1f))
+        header.addView(more, LinearLayout.LayoutParams(dp(a, 40), dp(a, 40)))
+        header.addView(close, LinearLayout.LayoutParams(dp(a, 40), dp(a, 40)))
 
-        // ---- اقتراحات سريعة
+        // ---- اقتراحات سريعة (Material Chips)
+        val input = EditText(a).apply {
+            hint = "اكتب أمرك…"; setTextColor(p.text); setHintTextColor(p.sub)
+            background = shape(p.surface, dp(a, 24).toFloat())
+            setPadding(dp(a, 16), dp(a, 10), dp(a, 16), dp(a, 10))
+            maxLines = 4; textSize = 14f
+            textDirection = View.TEXT_DIRECTION_ANY_RTL
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
         val chipsRow = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
         fun chip(label: String, onClick: () -> Unit) {
-            chipsRow.addView(button(a, label, p.text, Color.TRANSPARENT, 13f, 14, 8) { onClick() }.apply {
-                val r = dp(a, 18).toFloat()
-                background = ripple(outlined(Color.TRANSPARENT, r, p.line, dp(a, 1)), r)
-            },
-                LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = dp(a, 6) })
+            chipsRow.addView(Chip(a).apply {
+                text = label; setTextColor(p.text); isCheckable = false
+                setOnClickListener { onClick() }
+            }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = dp(a, 6) })
         }
-        chip("أصلح الملف") {
-            ask("أصلح الأخطاء فهاد الملف وعطيني الملف كامل مصحّح فبلوك كود واحد، مع شرح قصير للأخطاء.")
+        chip("مشروع جديد") {
+            input.setText("أنشئ مشروع أندرويد جديد باسم ")
+            input.setSelection(input.text.length); input.requestFocus()
         }
-        chip("اشرح الملف") { ask("اشرح ليا هاد الملف باختصار.") }
-        chip("اشرح التحديد") { ask("اشرح ليا الجزء المحدد فقط (Selected text) بالتفصيل.") }
-        chip("حسّن الكود") {
-            ask("حسّن جودة وقراءة الكود (التحديد إن وُجد، وإلا الملف) بلا ما تبدّل السلوك، وعطيني النتيجة فبلوك كود واحد.")
-        }
-        chip("اختبارات") { ask("كتب ليا اختبارات (unit tests) مناسبة للكود المحدد أو للملف الحالي.") }
-        chip("تعليقات") { ask("زيد تعليقات وتوثيق KDoc/Javadoc واضح للكود، وعطيني الملف كامل فبلوك كود واحد.") }
+        chip("أصلح الملف") { ask("أصلح الأخطاء في الملف المفتوح وطبّق الإصلاح مباشرة.") }
+        chip("اشرح الملف") { ask("اشرح لي هذا الملف باختصار.") }
+        chip("حسّن الكود") { ask("حسّن جودة وقراءة الكود (التحديد إن وُجد، وإلا الملف) دون تغيير السلوك، وطبّق التعديل مباشرة.") }
+        chip("اختبارات") { ask("اكتب اختبارات unit tests مناسبة للملف الحالي وأنشئها في مكانها الصحيح بالمشروع.") }
+        chip("تعليقات") { ask("أضف توثيق KDoc/Javadoc واضحا للملف الحالي وطبّقه مباشرة.") }
         chip("حلّل خطأ من الحافظة") {
             val c = clip()
             if (c == null) toast("الحافظة فارغة — انسخ اللوغ أولا")
-            else ask("حلّل هاد الخطأ/اللوغ وقلّي السبب والحل:\n```\n${c.take(6000)}\n```")
+            else ask("حلّل هذا الخطأ/اللوغ، وقل لي السبب، ثم أصلحه في المشروع إن أمكن:\n```\n${c.take(6000)}\n```")
         }
-        val chips = HorizontalScrollView(a).apply {
-            addView(chipsRow); isHorizontalScrollBarEnabled = false
-        }
+        val chips = HorizontalScrollView(a).apply { addView(chipsRow); isHorizontalScrollBarEnabled = false }
 
-        // ---- الإدخال
-        val input = EditText(a).apply {
-            hint = "اكتب رسالتك…"; setTextColor(p.text); setHintTextColor(p.sub)
-            background = shape(p.surface, dp(a, 24).toFloat())
-            setPadding(dp(a, 14), dp(a, 10), dp(a, 14), dp(a, 10))
-            maxLines = 4
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-        }
         send.setOnClickListener {
             if (busy) { cancel(); return@setOnClickListener }
             val t = input.text.toString().trim()
@@ -813,96 +1185,109 @@ object AiChat {
         // ---- التجميع
         val root = LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(a, 16), dp(a, 16), dp(a, 16), dp(a, 16))
-            background = shape(p.bg, dp(a, 28).toFloat())
+            setPadding(dp(a, 16), dp(a, 10), dp(a, 16), dp(a, 12))
+            background = sheetBackground(a, p)
         }
+        root.addView(View(a).apply { background = shape(p.line, dp(a, 2).toFloat()) },
+            LinearLayout.LayoutParams(dp(a, 32), dp(a, 4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(a, 10) })
         root.addView(header)
         root.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f).apply { topMargin = dp(a, 8) })
         root.addView(chips, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(a, 6); bottomMargin = dp(a, 8) })
         root.addView(inputRow)
 
+        onChange = { updateSend(); render() }
+        dialog.setOnDismissListener { onChange = null }
         updateSend(); render()
-        dialog.setContentView(root)
-        dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-        }
+        setupSheet(a, dialog, root, 56)
         dialog.show()
+    }
 
-        // ---- الكيبورد: نحسبو المساحة المرئية ونكيّفو الحوار معاها باش خانة الكتابة تبقى فوق الكيبورد
-        val dm = a.resources.displayMetrics
-        var lastKey = ""
-        var kbWasOpen = false
-        fun fit() {
-            val win = dialog.window ?: return
-            val r = Rect()
-            root.getWindowVisibleDisplayFrame(r)
-            var full = dm.heightPixels
-            var bottom = r.bottom
-            if (Build.VERSION.SDK_INT >= 30) {
-                try {
-                    full = a.windowManager.currentWindowMetrics.bounds.height()
-                    val ins = root.rootWindowInsets
-                    if (ins != null && ins.isVisible(WindowInsets.Type.ime())) {
-                        bottom = minOf(bottom, full - ins.getInsets(WindowInsets.Type.ime()).bottom)
+    // ------------------------------------------------------------ agent loop
+    private fun startRun(a: Activity, prompt: String) {
+        val prefs = AiPrefs(a)
+        lastError = null
+        val ed = EditorAccess.find(a)
+        val ws = AiAgent.Workspace(projectRoot(ed?.file()) ?: AiAgent.projectsDir(), AiAgent.projectsDir())
+        val system = buildSystem(ed, ws)
+        val first = buildPrompt(prompt, ed)
+        val runStart = AiPlugin.history.size
+        AiPlugin.history.add(AiClient.Msg("user", prompt))
+        val my = ++reqId
+        busy = true
+        notifyChange()
+
+        Thread {
+            var err: String? = null
+            val run = AiAgent.Run()
+            try {
+                var step = 0
+                while (my == reqId) {
+                    val snap = AiPlugin.history.toList()
+                    val cut = runStart.coerceAtMost(snap.size)
+                    val older = snap.subList(0, cut).takeLast(10).dropWhile { it.role != "user" }.map { AiAgent.compact(it) }
+                    val cur = snap.subList(cut, snap.size).toMutableList()
+                    if (cur.isNotEmpty()) cur[0] = AiClient.Msg("user", first)
+                    val reply = AiClient.complete(prefs, system, older + cur)
+                    if (my != reqId) break
+                    AiPlugin.history.add(AiClient.Msg("assistant", reply))
+                    notifyChange()
+
+                    val calls = AiAgent.parse(reply)
+                    if (calls.isEmpty()) break
+                    step++
+                    if (step > MAX_STEPS) {
+                        AiPlugin.history.add(AiClient.Msg("user", "<tool_results>\n</tool_results>"))
+                        AiPlugin.history.add(AiClient.Msg("assistant", "توقفت بعد $MAX_STEPS خطوة. اكتب «تابع» لإكمال العمل."))
+                        break
                     }
-                } catch (t: Throwable) { /* نكمّلو بالحساب العادي */ }
+                    val results = calls.map { AiAgent.execute(a, run, ws, it, prefs.askBeforeEdit) }
+                    if (my != reqId) break
+                    AiPlugin.history.add(AiClient.Msg("user", AiAgent.formatResults(results)))
+                    notifyChange()
+                }
+            } catch (t: Throwable) {
+                err = t.message ?: t.javaClass.simpleName
             }
-            val kbOpen = full - bottom > full * 0.15f
-            val maxH = (dm.heightPixels * 0.88f).toInt()
-            val gap = dp(a, 8)
-            val h = if (kbOpen) minOf(maxH, bottom - r.top - 2 * gap) else maxH
-            val y = if (kbOpen) r.top + gap else 0
-            val g = if (kbOpen) (Gravity.TOP or Gravity.CENTER_HORIZONTAL) else Gravity.CENTER
-            val w = (dm.widthPixels * 0.95f).toInt()
-            val key = "$w/$h/$y/$g"
-            if (key != lastKey) {
-                lastKey = key
-                val lp = win.attributes
-                lp.width = w; lp.height = h; lp.gravity = g; lp.x = 0; lp.y = y
-                win.attributes = lp
+            AiAgent.end(run)
+            ui.post {
+                if (my == reqId) {
+                    busy = false
+                    if (err != null) {
+                        val last = AiPlugin.history.lastOrNull()
+                        if (AiPlugin.history.size == runStart + 1 && last != null && last.role == "user") {
+                            AiPlugin.history.removeAt(AiPlugin.history.lastIndex)
+                        }
+                        lastError = err
+                    }
+                    AiPlugin.save(a)
+                    onChange?.invoke()
+                }
             }
-            if (kbOpen != kbWasOpen) {
-                kbWasOpen = kbOpen
-                scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
-            }
-        }
-        val gl = ViewTreeObserver.OnGlobalLayoutListener { fit() }
-        val decor = a.window.decorView
-        root.viewTreeObserver.addOnGlobalLayoutListener(gl)
-        decor.viewTreeObserver.addOnGlobalLayoutListener(gl)
-        root.setOnApplyWindowInsetsListener { v, ins -> v.post { fit() }; v.onApplyWindowInsets(ins) }
-        fun refit() { for (t in longArrayOf(120L, 300L, 600L)) root.postDelayed({ fit() }, t) }
-        input.setOnFocusChangeListener { _, f -> if (f) refit() }
-        input.setOnClickListener { refit() }
-        dialog.setOnDismissListener {
-            try { root.viewTreeObserver.removeOnGlobalLayoutListener(gl) } catch (t: Throwable) { }
-            try { decor.viewTreeObserver.removeOnGlobalLayoutListener(gl) } catch (t: Throwable) { }
-        }
-        fit()
+        }.start()
     }
 
     // -------------------------------------------------------------- settings
     fun showSettings(a: Activity) {
         val prefs = AiPrefs(a)
         val p = pal(a)
-        val dialog = Dialog(a)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val dialog = BottomSheetDialog(a)
 
         fun label(t: String) = TextView(a).apply {
-            text = t; setTextColor(p.sub); textSize = 12f; setPadding(0, dp(a, 12), 0, dp(a, 4))
+            text = t; setTextColor(p.sub); textSize = 12f; setPadding(0, dp(a, 14), 0, dp(a, 4))
         }
         fun field(h: String, v: String, pass: Boolean = false) = EditText(a).apply {
             hint = h; setText(v); setTextColor(p.text); setHintTextColor(p.sub); setSingleLine()
-            background = shape(p.surface, dp(a, 10).toFloat())
-            setPadding(dp(a, 12), dp(a, 10), dp(a, 12), dp(a, 10))
+            background = shape(p.surface, dp(a, 12).toFloat())
+            setPadding(dp(a, 14), dp(a, 12), dp(a, 14), dp(a, 12))
             inputType = if (pass) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_CLASS_TEXT
         }
 
+        val modes = listOf("تلقائي — ينفّذ مباشرة", "اسأل قبل كل تعديل")
         val provider = spinner(a, p, AiPrefs.PROVIDERS, prefs.provider)
         val model = field("فارغ = الموديل الافتراضي", prefs.model)
         val key = field("API Key", prefs.apiKey, pass = true)
         val base = field("اختياري (ضروري مع custom)", prefs.baseUrl)
+        val mode = spinner(a, p, modes, if (prefs.askBeforeEdit) modes[1] else modes[0])
         val theme = spinner(a, p, AiPrefs.THEMES, prefs.theme)
 
         fun save() {
@@ -910,25 +1295,29 @@ object AiChat {
             prefs.model = model.text.toString().trim()
             prefs.apiKey = key.text.toString().trim()
             prefs.baseUrl = base.text.toString().trim()
+            prefs.askBeforeEdit = mode.selectedItemPosition == 1
             prefs.theme = theme.selectedItem.toString()
         }
 
         val box = LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(a, 16), dp(a, 16), dp(a, 16), dp(a, 16))
-            background = shape(p.bg, dp(a, 20).toFloat())
+            setPadding(dp(a, 20), dp(a, 10), dp(a, 20), dp(a, 20))
+            background = sheetBackground(a, p)
         }
+        box.addView(View(a).apply { background = shape(p.line, dp(a, 2).toFloat()) },
+            LinearLayout.LayoutParams(dp(a, 32), dp(a, 4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(a, 12) })
         box.addView(TextView(a).apply {
-            text = "إعدادات المساعد"; setTextColor(p.text); textSize = 16f; typeface = Typeface.DEFAULT_BOLD
+            text = "إعدادات المساعد"; setTextColor(p.text); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
         })
         box.addView(label("المزوّد")); box.addView(provider)
         box.addView(label("الموديل")); box.addView(model)
         box.addView(label("API Key (كيتخزّن محليا فجهازك فقط)")); box.addView(key)
         box.addView(label("Base URL")); box.addView(base)
+        box.addView(label("وضع التنفيذ (الحذف دائما يطلب تأكيدا)")); box.addView(mode)
         box.addView(label("المظهر")); box.addView(theme)
 
         val row = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(pill(a, p, "اختبار الاتصال") {
+        row.addView(materialButton(a, p, "اختبار الاتصال", false) {
             save()
             Toast.makeText(a, "⏳ كنجرب الاتصال…", Toast.LENGTH_SHORT).show()
             Thread {
@@ -937,17 +1326,16 @@ object AiChat {
                 a.runOnUiThread { Toast.makeText(a, msg, Toast.LENGTH_LONG).show() }
             }.start()
         }, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginEnd = dp(a, 8) })
-        row.addView(pill(a, p, "حفظ", filled = true) {
+        row.addView(materialButton(a, p, "حفظ", true) {
             save()
             Toast.makeText(a, "تم الحفظ", Toast.LENGTH_SHORT).show()
             dialog.dismiss()
-        }, weight())
-        box.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(a, 16) })
+        }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        box.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(a, 20) })
 
-        dialog.setContentView(ScrollView(a).apply { addView(box) })
-        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        val sc = ScrollView(a).apply { addView(box); isVerticalScrollBarEnabled = false }
+        setupSheet(a, dialog, sc, 96)
         dialog.show()
-        dialog.window?.setLayout((a.resources.displayMetrics.widthPixels * 0.92).toInt(), WRAP)
     }
 
     // --------------------------------------------------------------- context
@@ -959,24 +1347,60 @@ object AiChat {
             val all = ed.allText()
             if (all.isNotBlank()) {
                 appendLine("\n## Full current file:\n```\n${all.take(12000)}\n```")
-                if (all.length > 12000) appendLine("(الملف طويل: تم اقتطاع الجزء الأخير)")
+                if (all.length > 12000) appendLine("(الملف طويل: تم اقتطاع الجزء الأخير — استعمل read_file لقراءته كاملا)")
             }
         }
     }
 
-    private fun buildSystem(ed: EditorAccess?): String = buildString {
-        appendLine("You are an AI coding assistant embedded inside AndroidIDE (an Android IDE running on Android).")
-        appendLine("Reply in the same language the user writes in. Be concise.")
-        appendLine("When you output code, give the COMPLETE ready-to-insert code inside ONE fenced code block.")
-        appendLine("If the user asks to change only the selected text, return only the replacement for that selection. If the user asks to change the file, return the complete updated file.")
-        appendLine("Do not invent files or APIs that are not in the project; if context is missing, say so.")
-        val root = projectRoot(ed?.file())
-        if (root != null) {
-            appendLine("\n## Project: ${root.name}")
-            val lines = mutableListOf<String>()
-            tree(root, root, 0, lines)
-            lines.forEach { appendLine("- $it") }
-        }
+    private val AGENT_RULES = """
+You are an autonomous coding AGENT embedded inside AndroidIDE (an Android IDE running on the phone).
+The user gives short commands and you EXECUTE them with tools. Never just describe what to do when you can do it.
+Reply in the same language the user writes in. Keep chat text short.
+
+## Tools
+Emit tool calls as tag blocks in your reply (several per reply are allowed; they run in order).
+The results come back in the next message inside <tool_results>. Continue until the task is fully done,
+then reply with a SHORT summary and NO tool tags.
+
+<tool name="list_dir" path="dir"/>
+<tool name="read_file" path="file"/>
+<tool name="write_file" path="file">
+complete file content, raw (no code fence, no escaping)
+</tool>
+<tool name="edit_file" path="file">
+<find>exact existing text (copy it verbatim, must be unique in the file)</find>
+<replace>new text</replace>
+</tool>
+<tool name="create_dir" path="dir"/>
+<tool name="move" path="from" to="to"/>
+<tool name="delete" path="file-or-dir"/>
+<tool name="search" query="text" path="dir"/>
+
+## Rules
+- Paths are relative to the workspace root, or absolute inside the projects folder (both given below).
+- To create a NEW project, use absolute paths under the projects folder and write every file the project needs
+  (settings.gradle.kts, build.gradle.kts, app/build.gradle.kts, gradle.properties, AndroidManifest.xml,
+  MainActivity, layouts/values). Tell the user once that the Gradle wrapper must be added/synced by the IDE.
+- Use edit_file for small changes in existing files, write_file for new files or full rewrites.
+  Always write COMPLETE files: never placeholders such as "rest of the code unchanged".
+- read_file before editing a file you have not seen. The currently open file is included in the first message.
+- Do not paste into the chat the code you already wrote with tools.
+- If the request is ambiguous, pick the most reasonable option and proceed; ask only when truly blocked.
+- If the user only wants an explanation or review, answer in text without tools.
+- If the user asks for a snippet only, return ONE fenced code block with the complete ready-to-insert code.
+- Do not invent APIs or files that are not in the project; verify with list_dir/search/read_file.
+- After write/edit, if something may break (imports, manifest entries, dependencies), fix it in the same run.
+"""
+
+    private fun buildSystem(ed: EditorAccess?, ws: AiAgent.Workspace): String = buildString {
+        appendLine(AGENT_RULES.trim())
+        appendLine("\n## Workspace root: ${ws.root.path}")
+        appendLine("## Projects folder: ${ws.projects.path}")
+        appendLine("\n## Files in workspace:")
+        val lines = mutableListOf<String>()
+        tree(ws.root, ws.root, 0, lines)
+        lines.forEach { appendLine("- $it") }
+        if (lines.isEmpty()) appendLine("(empty)")
     }
 
     private fun projectRoot(f: File?): File? {
@@ -1004,6 +1428,7 @@ object AiChat {
         }
     }
 }
+
 KT_EOF
 
 # ---------------------------------------------------------------- AiPlugin.kt
@@ -1013,27 +1438,26 @@ package com.itsaky.androidide.ai
 import android.app.Activity
 import android.app.Application
 import android.content.Context
-import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.content.res.ColorStateList
 import android.os.Bundle
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import android.widget.TextView
+import com.google.android.material.floatingactionbutton.FloatingActionButton
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 
-/** نقطة الدخول: كتتسجل مرة وحدة من Application.onCreate وكتحط زر AI عائم فشاشة المحرر. */
+/** نقطة الدخول: كتتسجل مرة وحدة من Application.onCreate وكتحط زر AI عائم (Material FAB) فشاشة المحرر. */
 object AiPlugin {
 
-    private const val MAX_HISTORY = 40
+    private const val MAX_HISTORY = 80
 
     @Volatile private var installed = false
-    val history = mutableListOf<AiClient.Msg>()
+    val history: MutableList<AiClient.Msg> = CopyOnWriteArrayList()
 
     @JvmStatic
     fun install(app: Application) {
@@ -1078,60 +1502,93 @@ object AiPlugin {
     private fun attachFab(a: Activity) {
         val content = a.findViewById<ViewGroup>(android.R.id.content) ?: return
         if (content.findViewWithTag<View>("ai_fab") != null) return
-        val d = a.resources.displayMetrics.density
-        val st = AiChat.fabStyle(a)
-        val fab = TextView(a).apply {
-            tag = "ai_fab"; text = "AI"; setTextColor(st[1]); textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER; elevation = 6 * d
-            background = GradientDrawable().apply { setColor(st[0]); cornerRadius = 16 * d }
-        }
-        val size = (56 * d).toInt()
-        val lp = FrameLayout.LayoutParams(size, size, Gravity.BOTTOM or Gravity.RIGHT)
-            .apply { setMargins(0, 0, (16 * d).toInt(), (110 * d).toInt()) }
-        content.addView(fab, lp)
-
-        // سحب الزر + ضغطة قصيرة تفتح الشات + يلصق مع أقرب حافة
-        var sx = 0f; var sy = 0f; var tx = 0f; var ty = 0f; var moved = false
-        fab.setOnTouchListener { v, e ->
-            when (e.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    sx = e.rawX; sy = e.rawY; tx = v.translationX; ty = v.translationY; moved = false
-                    v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(80).start()
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val mx = e.rawX - sx; val my = e.rawY - sy
-                    if (abs(mx) > 12 * d || abs(my) > 12 * d) moved = true
-                    if (moved) { v.translationX = tx + mx; v.translationY = ty + my }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
-                    if (!moved) {
-                        AiChat.show(a)
-                    } else {
-                        val pw = content.width.toFloat()
-                        val ph = content.height.toFloat()
-                        val left = v.left.toFloat()
-                        val top = v.top.toFloat()
-                        val cx = left + v.translationX + v.width / 2f
-                        val edge = 8 * d
-                        val targetX = if (cx < pw / 2f) edge else pw - v.width - edge
-                        val targetY = (top + v.translationY).coerceIn(edge, (ph - v.height - edge).coerceAtLeast(edge))
-                        v.animate().translationX(targetX - left).translationY(targetY - top).setDuration(180).start()
-                    }
-                    true
-                }
-                MotionEvent.ACTION_CANCEL -> {
-                    v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
-                    true
-                }
-                else -> false
+        try {
+            val d = a.resources.displayMetrics.density
+            val st = AiChat.fabStyle(a)
+            // FloatingActionButton من Material: يأخذ شكل وظلال وحركة التطبيق تلقائيا
+            val fab = FloatingActionButton(a).apply {
+                tag = "ai_fab"
+                contentDescription = "مساعد الذكاء الاصطناعي"
+                backgroundTintList = ColorStateList.valueOf(st[0])
+                imageTintList = ColorStateList.valueOf(st[1])
+                setImageDrawable(AiChat.icon(a, "ic_ai_sparkle"))
             }
-        }
+            val lp = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END
+            ).apply {
+                bottomMargin = (110 * d).toInt()
+                marginEnd = (16 * d).toInt()
+            }
+            content.addView(fab, lp)
+
+            // سحب الزر + ضغطة قصيرة تفتح الشات + يلصق مع أقرب حافة
+            var sx = 0f; var sy = 0f; var tx = 0f; var ty = 0f; var moved = false
+            fab.setOnTouchListener { v, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        sx = e.rawX; sy = e.rawY; tx = v.translationX; ty = v.translationY; moved = false
+                        v.animate().scaleX(0.92f).scaleY(0.92f).setDuration(80).start()
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val mx = e.rawX - sx; val my = e.rawY - sy
+                        if (abs(mx) > 12 * d || abs(my) > 12 * d) moved = true
+                        if (moved) { v.translationX = tx + mx; v.translationY = ty + my }
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                        if (!moved) {
+                            AiChat.show(a)
+                        } else {
+                            val pw = content.width.toFloat()
+                            val ph = content.height.toFloat()
+                            val left = v.left.toFloat()
+                            val top = v.top.toFloat()
+                            val cx = left + v.translationX + v.width / 2f
+                            val edge = 8 * d
+                            val targetX = if (cx < pw / 2f) edge else pw - v.width - edge
+                            val targetY = (top + v.translationY).coerceIn(edge, (ph - v.height - edge).coerceAtLeast(edge))
+                            v.animate().translationX(targetX - left).translationY(targetY - top).setDuration(180).start()
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                        true
+                    }
+                    else -> false
+                }
+            }
+        } catch (t: Throwable) { /* ما نكسرو شاشة المحرر إلا وقع مشكل فالـ theme */ }
     }
 }
+
 KT_EOF
+
+# ---------------------------------------------------------------- أيقونات vector + keep (للـ release)
+RES="$APP/src/main/res"
+mkdir -p "$RES/drawable" "$RES/raw"
+mkicon() { # name pathData
+  cat > "$RES/drawable/$1.xml" <<ICON_EOF
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFFFF" android:pathData="$2"/>
+</vector>
+ICON_EOF
+}
+mkicon ic_ai_sparkle "M12,2l2.4,6.6L21,11l-6.6,2.4L12,20l-2.4,-6.6L3,11l6.6,-2.4zM19,16l0.9,2.1L22,19l-2.1,0.9L19,22l-0.9,-2.1L16,19l2.1,-0.9z"
+mkicon ic_ai_send "M2.01,21L23,12L2.01,3L2,10l15,2l-15,2z"
+mkicon ic_ai_stop "M7,7h10v10H7z"
+mkicon ic_ai_close "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12z"
+mkicon ic_ai_more "M12,8c1.1,0 2,-0.9 2,-2s-0.9,-2 -2,-2s-2,0.9 -2,2s0.9,2 2,2zM12,10c-1.1,0 -2,0.9 -2,2s0.9,2 2,2s2,-0.9 2,-2s-0.9,-2 -2,-2zM12,16c-1.1,0 -2,0.9 -2,2s0.9,2 2,2s2,-0.9 2,-2s-0.9,-2 -2,-2z"
+cat > "$RES/raw/ai_keep.xml" <<'KEEP_EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_ai_*" />
+KEEP_EOF
 
 # ---------------------------------------------------------------- إزالة LeakCanary (تطبيق "Leaks")
 echo "🧹 كنقلّب على LeakCanary..."
