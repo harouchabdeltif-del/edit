@@ -2137,4 +2137,327 @@ one shell command (runs in the workspace; the user must approve every command)
 - When the user asks to create a folder, file, screen, UI or project: DO IT NOW with create_dir + write_file. Never answer with instructions only.
 - "Create a folder X and put Y in it" means: create_dir X, then write_file X/<files>. Use the workspace root unless the user gives another path.
 - For a screen/UI in an Android project: write the XML layout (res/layout), its Activity or Fragment, any strings/colors/styles it needs,
-  and register a new Activity in AndroidManifest.xm
+  and register a new Activity in AndroidManifest.xml with edit_file. If the project uses Jetpack Compose, write Composables instead.
+- Make UIs look good: Material 3 components, 16dp paddings, clear hierarchy, labels/hints in the user's language, no placeholder text.
+- Plain folders/files outside an Android project (HTML, scripts, notes) are fine too: just create exactly what was asked.
+- Use run only when a shell command is really needed (for example chmod or a build); prefer the file tools for everything else.
+- When finished, reply with a SHORT summary (1-3 lines) naming what was created, with paths.
+"""
+
+    private fun buildSystem(ed: EditorAccess?, ws: AiAgent.Workspace): String = buildString {
+        appendLine(AGENT_RULES.trim())
+        appendLine("\n## Workspace root: ${ws.root.path}")
+        appendLine("## Projects folder: ${ws.projects.path}")
+        appendLine("\n## Files in workspace:")
+        val lines = mutableListOf<String>()
+        tree(ws.root, ws.root, 0, lines)
+        lines.forEach { appendLine("- $it") }
+        if (lines.isEmpty()) appendLine("(empty)")
+    }
+
+    private fun projectRoot(f: File?): File? {
+        val first = f?.parentFile
+        var d = first
+        while (d != null) {
+            if (File(d, "settings.gradle").exists() || File(d, "settings.gradle.kts").exists()) return d
+            d = d.parentFile
+        }
+        return first
+    }
+
+    private val skip = setOf("build", ".gradle", ".git", ".idea", ".cxx", ".kotlin", "node_modules")
+    private val skipExt = setOf(
+        "png", "jpg", "jpeg", "webp", "gif", "jar", "aar", "apk", "so", "zip",
+        "ttf", "otf", "mp3", "mp4", "class", "dex", "keystore", "jks"
+    )
+
+    private fun tree(root: File, dir: File, depth: Int, out: MutableList<String>) {
+        if (depth > 6 || out.size >= 100) return
+        dir.listFiles()?.sortedBy { it.name }?.forEach { f ->
+            if (out.size >= 100 || f.name in skip) return@forEach
+            if (f.isDirectory) tree(root, f, depth + 1, out)
+            else if (f.extension.lowercase() !in skipExt) out.add(f.relativeTo(root).path)
+        }
+    }
+}
+KT_EOF
+
+# ---------------------------------------------------------------- AiPlugin.kt
+cat > "$PKG_DIR/AiPlugin.kt" <<'KT_EOF'
+package com.itsaky.androidide.ai
+
+import android.app.Activity
+import android.app.Application
+import android.content.Context
+import android.content.res.ColorStateList
+import android.os.Bundle
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.graphics.Rect
+import android.widget.FrameLayout
+import com.google.android.material.floatingactionbutton.FloatingActionButton
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.abs
+
+/** نقطة الدخول: كتتسجل مرة وحدة من Application.onCreate وكتحط زر AI عائم (Material FAB) فشاشة المحرر. */
+object AiPlugin {
+
+    private const val MAX_HISTORY = 80
+
+    @Volatile private var installed = false
+    val history: MutableList<AiClient.Msg> = CopyOnWriteArrayList()
+
+    @JvmStatic
+    fun install(app: Application) {
+        if (installed) return
+        installed = true
+        load(app)
+        app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(a: Activity) { if (a.javaClass.simpleName.contains("Editor")) attachFab(a) }
+            override fun onActivityCreated(a: Activity, s: Bundle?) {}
+            override fun onActivityStarted(a: Activity) {}
+            override fun onActivityPaused(a: Activity) {}
+            override fun onActivityStopped(a: Activity) {}
+            override fun onActivitySaveInstanceState(a: Activity, o: Bundle) {}
+            override fun onActivityDestroyed(a: Activity) {}
+        })
+    }
+
+    // ------------------------------------------------------------ history persistence
+    fun load(ctx: Context) {
+        try {
+            val raw = AiPrefs(ctx).history
+            if (raw.isBlank()) return
+            val arr = JSONArray(raw)
+            history.clear()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                history.add(AiClient.Msg(o.getString("role"), o.getString("content")))
+            }
+        } catch (t: Throwable) { /* سجل تالف: نتجاهله */ }
+    }
+
+    fun save(ctx: Context) {
+        try {
+            while (history.size > MAX_HISTORY) history.removeAt(0)
+            val arr = JSONArray()
+            history.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
+            AiPrefs(ctx).history = arr.toString()
+        } catch (t: Throwable) { /* ما نكسرو التطبيق بسبب الحفظ */ }
+    }
+
+    // ------------------------------------------------------------ floating button
+    private fun attachFab(a: Activity) {
+        val content = a.findViewById<ViewGroup>(android.R.id.content) ?: return
+        if (content.findViewWithTag<View>("ai_fab") != null) return
+        try {
+            val d = a.resources.displayMetrics.density
+            val st = AiChat.fabStyle(a)
+            // FloatingActionButton من Material: يأخذ شكل وظلال وحركة التطبيق تلقائيا
+            val fab = FloatingActionButton(a).apply {
+                tag = "ai_fab"
+                contentDescription = "مساعد الذكاء الاصطناعي"
+                backgroundTintList = ColorStateList.valueOf(st[0])
+                imageTintList = ColorStateList.valueOf(st[1])
+                setImageDrawable(AiChat.icon(a, "ic_ai_sparkle"))
+            }
+            val lp = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END
+            ).apply {
+                bottomMargin = (110 * d).toInt()
+                marginEnd = (16 * d).toInt()
+            }
+            content.addView(fab, lp)
+
+            // لو كاين FAB آخر ظاهر فالشاشة (مثل أزرار لوحة السجلات) نخبّيو الزر ديالنا باش ما يتداخلوش
+            val check = Runnable {
+                val hide = otherFabOnScreen(content, fab)
+                val want = if (hide) View.GONE else View.VISIBLE
+                if (fab.visibility != want) fab.visibility = want
+            }
+            content.viewTreeObserver.addOnGlobalLayoutListener {
+                content.removeCallbacks(check)
+                content.postDelayed(check, 120)
+            }
+
+            // سحب الزر + ضغطة قصيرة تفتح الشات + يلصق مع أقرب حافة
+            var sx = 0f; var sy = 0f; var tx = 0f; var ty = 0f; var moved = false
+            fab.setOnTouchListener { v, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        sx = e.rawX; sy = e.rawY; tx = v.translationX; ty = v.translationY; moved = false
+                        v.animate().scaleX(0.92f).scaleY(0.92f).setDuration(80).start()
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val mx = e.rawX - sx; val my = e.rawY - sy
+                        if (abs(mx) > 12 * d || abs(my) > 12 * d) moved = true
+                        if (moved) { v.translationX = tx + mx; v.translationY = ty + my }
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                        if (!moved) {
+                            AiChat.show(a)
+                        } else {
+                            val pw = content.width.toFloat()
+                            val ph = content.height.toFloat()
+                            val left = v.left.toFloat()
+                            val top = v.top.toFloat()
+                            val cx = left + v.translationX + v.width / 2f
+                            val edge = 8 * d
+                            val targetX = if (cx < pw / 2f) edge else pw - v.width - edge
+                            val targetY = (top + v.translationY).coerceIn(edge, (ph - v.height - edge).coerceAtLeast(edge))
+                            v.animate().translationX(targetX - left).translationY(targetY - top).setDuration(180).start()
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                        true
+                    }
+                    else -> false
+                }
+            }
+        } catch (t: Throwable) { /* ما نكسرو شاشة المحرر إلا وقع مشكل فالـ theme */ }
+    }
+
+    private fun otherFabOnScreen(x: View, self: View): Boolean {
+        if (x === self || x.visibility != View.VISIBLE) return false
+        if (x.javaClass.name.contains("FloatingActionButton") && x.isShown && x.getGlobalVisibleRect(Rect())) return true
+        if (x is ViewGroup) for (i in 0 until x.childCount) if (otherFabOnScreen(x.getChildAt(i), self)) return true
+        return false
+    }
+}
+KT_EOF
+
+# ---------------------------------------------------------------- أيقونات vector + keep (للـ release)
+RES="$APP/src/main/res"
+mkdir -p "$RES/drawable" "$RES/raw"
+mkicon() { # name pathData
+  cat > "$RES/drawable/$1.xml" <<ICON_EOF
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFFFF" android:pathData="$2"/>
+</vector>
+ICON_EOF
+}
+mkicon ic_ai_sparkle "M12,2l2.4,6.6L21,11l-6.6,2.4L12,20l-2.4,-6.6L3,11l6.6,-2.4zM19,16l0.9,2.1L22,19l-2.1,0.9L19,22l-0.9,-2.1L16,19l2.1,-0.9z"
+mkicon ic_ai_send "M2.01,21L23,12L2.01,3L2,10l15,2l-15,2z"
+mkicon ic_ai_stop "M7,7h10v10H7z"
+mkicon ic_ai_close "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12z"
+mkicon ic_ai_more "M12,8c1.1,0 2,-0.9 2,-2s-0.9,-2 -2,-2s-2,0.9 -2,2s0.9,2 2,2zM12,10c-1.1,0 -2,0.9 -2,2s0.9,2 2,2s2,-0.9 2,-2s-0.9,-2 -2,-2zM12,16c-1.1,0 -2,0.9 -2,2s0.9,2 2,2s2,-0.9 2,-2s-0.9,-2 -2,-2z"
+mkicon ic_ai_chevron "M16.59,8.59L12,13.17L7.41,8.59L6,10l6,6l6,-6z"
+cat > "$RES/raw/ai_keep.xml" <<'KEEP_EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_ai_*" />
+KEEP_EOF
+
+# ---------------------------------------------------------------- إزالة LeakCanary (تطبيق "Leaks")
+echo "🧹 كنقلّب على LeakCanary..."
+LC_USES="$(grep -rIl -i 'leakcanary' "$ROOT" --include='*.kt' --include='*.java' --include='*.xml' \
+  --exclude-dir=build --exclude-dir=.git --exclude-dir=.gradle 2>/dev/null \
+  | grep -v '/src/debug/res/values/leakcanary_config.xml' || true)"
+LC_BLD="$(grep -rIl -i 'leakcanary' "$ROOT" --include='*.kts' --include='*.gradle' --include='*.toml' \
+  --exclude-dir=build --exclude-dir=.git --exclude-dir=.gradle 2>/dev/null || true)"
+if [ -z "$LC_USES" ] && [ -n "$LC_BLD" ]; then
+  for f in $LC_BLD; do
+    [ -f "$f.ai-bak" ] || cp "$f" "$f.ai-bak"
+    sed -i '/leakcanary/Id' "$f"
+    echo "🗑️  حيّدت LeakCanary من $f"
+  done
+else
+  if [ -n "$LC_USES" ]; then
+    echo "⚠️ LeakCanary مستعمل فالكود، غنخبّي الأيقونة فقط:"; echo "$LC_USES"
+  fi
+  LCD="$APP/src/debug/res/values"; mkdir -p "$LCD"
+  printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<resources>' \
+    '    <bool name="leak_canary_add_launcher_icon">false</bool>' '</resources>' > "$LCD/leakcanary_config.xml"
+fi
+
+# ---------------------------------------------------------------- patch Application + Manifest
+python3 - "$ROOT" "$NEW_APPID" <<'PY_EOF'
+import re, sys, os, pathlib
+
+root = pathlib.Path(sys.argv[1])
+app_dir = pathlib.Path(os.environ["APP_DIR"])
+src = app_dir / "src"
+MARK = "com.itsaky.androidide.ai.AiPlugin"
+
+# 1) Application class ------------------------------------------------------
+cands = []
+for p in src.rglob("*"):
+    if p.suffix not in (".kt", ".java") or "/ai/" in str(p):
+        continue
+    t = p.read_text(errors="ignore")
+    if re.search(r":\s*\w*Application\w*\s*\(\)|extends\s+\w*Application\b", t) and "onCreate" in t:
+        cands.append((p, t))
+
+cands.sort(key=lambda c: (0 if "IDEApplication" in c[0].name else 1, str(c[0])))
+if not cands:
+    print("⚠️  ما لقيتش كلاس Application. زيد هاد السطر يدويا فـ Application.onCreate():")
+    print("    com.itsaky.androidide.ai.AiPlugin.install(this)")
+else:
+    p, t = cands[0]
+    if MARK in t:
+        print(f"ℹ️  {p.name} مبدّل من قبل")
+    else:
+        is_kt = p.suffix == ".kt"
+        m = re.search(r"(override\s+fun\s+onCreate\s*\(\s*\)\s*\{|void\s+onCreate\s*\(\s*\)\s*\{)", t)
+        if not m:
+            print(f"⚠️  ما لقيتش onCreate() فـ {p}. زيد السطر يدويا.")
+        else:
+            sup = re.compile(r"super\.onCreate\(\)[ \t]*;?").search(t, m.end())
+            pos = sup.end() if sup else m.end()
+            snippet = (
+                "\n        runCatching { com.itsaky.androidide.ai.AiPlugin.install(this) }"
+                if is_kt else
+                "\n        try { com.itsaky.androidide.ai.AiPlugin.install(this); } catch (Throwable ignored) {}"
+            )
+            (p.parent / (p.name + ".ai-bak")).write_text(t)
+            p.write_text(t[:pos] + snippet + t[pos:])
+            print(f"✅ بدّلت {p.relative_to(root)}")
+
+# 3) applicationId (اختياري) -------------------------------------------------
+new_id = sys.argv[2] if len(sys.argv) > 2 else ""
+if new_id:
+    for name in ("build.gradle.kts", "build.gradle"):
+        g = app_dir / name
+        if g.exists():
+            t = g.read_text()
+            m = re.search(r'applicationId\s*=?\s*["\']([^"\']+)["\']', t)
+            if not m:
+                print(f"⚠️  ما لقيتش applicationId فـ {name} (يمكن كيجي من BuildConfig/convention plugin)")
+            else:
+                (g.parent / (name + ".ai-bak")).write_text(t)
+                t = t[:m.start(1)] + new_id + t[m.end(1):]
+                g.write_text(t)
+                print(f"✅ applicationId: {m.group(1)} → {new_id}")
+            break
+
+# 2) INTERNET permission -----------------------------------------------------
+mf = src / "main" / "AndroidManifest.xml"
+if mf.exists():
+    t = mf.read_text()
+    if "android.permission.INTERNET" in t:
+        print("ℹ️  صلاحية INTERNET موجودة")
+    else:
+        (mf.parent / "AndroidManifest.xml.ai-bak").write_text(t)
+        t = re.sub(r"(<manifest[^>]*>)",
+                   r'\1\n    <uses-permission android:name="android.permission.INTERNET"/>', t, count=1)
+        mf.write_text(t)
+        print("✅ زدت صلاحية INTERNET")
+PY_EOF
+
+echo
+echo "✅ تمّ الحقن. دابا بني التطبيق:"
+rel="${APP#"$ROOT"/}"; GPATH=":${rel//\//:}"
+echo "   cd $ROOT && ./gradlew ${GPATH}:assembleDebug"
+echo "   (للتراجع: bash inject-ai.sh $ROOT undo)"
