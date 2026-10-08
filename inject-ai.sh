@@ -121,20 +121,28 @@ object AiClient {
     class ApiException(val code: Int, message: String) : RuntimeException(message)
 
     /** كيعاود الطلب حتى 3 مرات فحالة 429 أو أخطاء السيرفر (5xx). */
+    private const val NO_NATIVE =
+        "\n\nIMPORTANT: Do NOT use native function/tool calling of the API (no browser, no functions, no python). " +
+        "Tools exist ONLY as plain-text <tool .../> tags written inside your normal reply."
+
     fun complete(p: AiPrefs, system: String, msgs: List<Msg>): String {
         require(p.apiKey.isNotBlank()) { "ضع مفتاح API من الإعدادات" }
         var last: ApiException? = null
+        var sys = system
         for (attempt in 0 until 3) {
             try {
                 return when (p.provider) {
-                    "claude" -> claude(p, system, msgs)
-                    "gemini" -> gemini(p, system, msgs)
-                    else -> openAiCompatible(p, system, msgs)
+                    "claude" -> claude(p, sys, msgs)
+                    "gemini" -> gemini(p, sys, msgs)
+                    else -> openAiCompatible(p, sys, msgs)
                 }
             } catch (e: ApiException) {
-                if (e.code != 429 && e.code < 500) throw e
+                // بعض النماذج (مثل gpt-oss) تحاول استدعاء أداة أصلية فيرفضها المزوّد: نعيد الطلب بتذكير صريح
+                val nativeTool = e.code == 400 && (e.message ?: "").contains("tool", ignoreCase = true)
+                if (!nativeTool && e.code != 429 && e.code < 500) throw e
+                if (nativeTool) sys = system + NO_NATIVE
                 last = e
-                if (attempt < 2) Thread.sleep(1500L * (attempt + 1))
+                if (attempt < 2) Thread.sleep(if (nativeTool) 400L else 1500L * (attempt + 1))
             }
         }
         throw last ?: IllegalStateException("فشل الطلب")
@@ -830,14 +838,22 @@ object AiChat {
     private fun setupSheet(a: Activity, dialog: BottomSheetDialog, content: View, topOffsetDp: Int) {
         dialog.setContentView(content)
         dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        val off = dp(a, topOffsetDp)
         (content.parent as? View)?.let { sheet ->
             sheet.setBackgroundColor(Color.TRANSPARENT)
-            sheet.layoutParams.height = MATCH
+            // ارتفاع الـ sheet = ارتفاع النافذة - الهامش العلوي (يتغير مع الكيبورد) باش خانة الكتابة تبقى ظاهرة
+            (sheet.parent as? View)?.addOnLayoutChangeListener { _, _, t, _, b, _, _, _, _ ->
+                val h = (b - t) - off
+                if (h > 0 && sheet.layoutParams.height != h) {
+                    sheet.layoutParams.height = h
+                    sheet.requestLayout()
+                }
+            }
         }
         dialog.behavior.apply {
             skipCollapsed = true
             isFitToContents = false
-            expandedOffset = dp(a, topOffsetDp)
+            expandedOffset = off
             state = BottomSheetBehavior.STATE_EXPANDED
         }
     }
@@ -1389,6 +1405,8 @@ complete file content, raw (no code fence, no escaping)
 - If the user only wants an explanation or review, answer in text without tools.
 - If the user asks for a snippet only, return ONE fenced code block with the complete ready-to-insert code.
 - Do not invent APIs or files that are not in the project; verify with list_dir/search/read_file.
+- NEVER claim that you created or changed anything unless a <tool_results> block confirmed it. Do the work with tools first.
+- NEVER use the API's native function calling. Tools are ONLY the plain-text <tool .../> tags above.
 - After write/edit, if something may break (imports, manifest entries, dependencies), fix it in the same run.
 """
 
@@ -1444,6 +1462,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.graphics.Rect
 import android.widget.FrameLayout
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import org.json.JSONArray
@@ -1522,6 +1541,17 @@ object AiPlugin {
             }
             content.addView(fab, lp)
 
+            // لو كاين FAB آخر ظاهر فالشاشة (مثل أزرار لوحة السجلات) نخبّيو الزر ديالنا باش ما يتداخلوش
+            val check = Runnable {
+                val hide = otherFabOnScreen(content, fab)
+                val want = if (hide) View.GONE else View.VISIBLE
+                if (fab.visibility != want) fab.visibility = want
+            }
+            content.viewTreeObserver.addOnGlobalLayoutListener {
+                content.removeCallbacks(check)
+                content.postDelayed(check, 120)
+            }
+
             // سحب الزر + ضغطة قصيرة تفتح الشات + يلصق مع أقرب حافة
             var sx = 0f; var sy = 0f; var tx = 0f; var ty = 0f; var moved = false
             fab.setOnTouchListener { v, e ->
@@ -1562,6 +1592,13 @@ object AiPlugin {
                 }
             }
         } catch (t: Throwable) { /* ما نكسرو شاشة المحرر إلا وقع مشكل فالـ theme */ }
+    }
+
+    private fun otherFabOnScreen(x: View, self: View): Boolean {
+        if (x === self || x.visibility != View.VISIBLE) return false
+        if (x.javaClass.name.contains("FloatingActionButton") && x.isShown && x.getGlobalVisibleRect(Rect())) return true
+        if (x is ViewGroup) for (i in 0 until x.childCount) if (otherFabOnScreen(x.getChildAt(i), self)) return true
+        return false
     }
 }
 
