@@ -87,54 +87,73 @@ jobs:
           done
 
       # مفتاح GPG ديال packages.androidide.com سالا => apt update كيفشل فأول تشغيل
-      # => نزيدو [trusted=yes] فـ sources.list داخل bootstrap-*.zip قبل ما يتدمجو فالـ APK
+      # => نزيدو [trusted=yes] فـ sources.list داخل bootstrap-*.zip
+      # (الـ zip كيتحمل وقت البناء، فكنشغلو watcher فالخلفية كيصحّحو أول ما يبان)
       - name: Prepare bootstrap patch (expired GPG key)
         run: |
+          mkdir -p ~/.gradle/init.d
           cat > ~/patch-bootstrap.py <<'EOF'
           import os, re, sys, zipfile
 
           root = sys.argv[1]
-          base = os.path.join(root, "termux")
-          if os.path.isdir(base):
-              root = base
+          verbose = "-v" in sys.argv[2:]
 
           def fix(text):
               text = re.sub(r"^(deb(?:-src)?)[ \t]+(?!\[)", r"\1 [trusted=yes] ", text, flags=re.M)
               text = re.sub(r"^(deb(?:-src)?[ \t]+\[)(?![^\]]*trusted=)", r"\1trusted=yes ", text, flags=re.M)
               return text
 
+          def is_apt_list(n):
+              return n.startswith("etc/apt/") and n.endswith(".list")
+
+          def needs_patch(path):
+              try:
+                  with zipfile.ZipFile(path) as z:
+                      for n in z.namelist():
+                          if is_apt_list(n):
+                              t = z.read(n).decode("utf-8", "replace")
+                              if fix(t) != t:
+                                  return True
+              except Exception as e:
+                  if verbose:
+                      print("skip", path, e)
+              return False
+
           def patch(path):
               tmp = path + ".tmp"
-              changed = False
-              with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w") as zout:
-                  for item in zin.infolist():
-                      data = zin.read(item.filename)
-                      n = item.filename
-                      if n.startswith("etc/apt/") and n.endswith(".list"):
-                          old = data.decode("utf-8")
-                          new = fix(old)
-                          if new != old:
-                              data = new.encode("utf-8")
-                              changed = True
-                              print("  patched:", n)
-                      zout.writestr(item, data)
-              if changed:
+              try:
+                  with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w") as zout:
+                      for item in zin.infolist():
+                          data = zin.read(item.filename)
+                          if is_apt_list(item.filename):
+                              old = data.decode("utf-8")
+                              new = fix(old)
+                              if new != old:
+                                  data = new.encode("utf-8")
+                                  print("  patched:", item.filename)
+                          zout.writestr(item, data)
                   os.replace(tmp, path)
-              else:
-                  os.remove(tmp)
-              print(("PATCHED " if changed else "OK(no change) ") + path)
+                  print("PATCHED " + path)
+              except Exception as e:
+                  print("FAILED", path, e)
+                  if os.path.exists(tmp):
+                      os.remove(tmp)
 
           found = 0
           for d, dirs, files in os.walk(root):
-              dirs[:] = [x for x in dirs if x not in (".git", "build", ".gradle")]
+              dirs[:] = [x for x in dirs if x not in (".git", ".gradle", "node_modules")]
               for f in files:
-                  if f.startswith("bootstrap-") and f.endswith(".zip"):
+                  if f.startswith("bootstrap") and f.endswith(".zip"):
                       found += 1
-                      patch(os.path.join(d, f))
-          print("bootstrap zips found:", found)
+                      full = os.path.join(d, f)
+                      if needs_patch(full):
+                          patch(full)
+                      elif verbose:
+                          print("OK(no change) " + full)
+          if verbose:
+              print("bootstrap zips found:", found)
           EOF
 
-          # Gradle init script: يعاود التصحيح بعد تحميل الـ bootstrap وقبل البناء native/assets
           cat > ~/.gradle/init.d/patch-bootstrap.gradle <<'EOF'
           allprojects {
             tasks.configureEach { t ->
@@ -153,7 +172,7 @@ jobs:
           }
           EOF
 
-          python3 ~/patch-bootstrap.py AndroidIDE
+          python3 ~/patch-bootstrap.py AndroidIDE -v
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -168,20 +187,24 @@ jobs:
         run: |
           cd AndroidIDE
           chmod +x gradlew
+          # watcher: كيصحّح bootstrap-*.zip كل 3 ثواني فالخلفية طول البناء
+          ( while true; do python3 ~/patch-bootstrap.py "$PWD" >> ~/bootstrap-watch.log 2>&1; sleep 3; done ) &
+          WATCH=$!
+          trap 'kill "$WATCH" 2>/dev/null || true' EXIT
           ./gradlew :core:app:assembleDebug -x :core:app:validateSigningDebug \
             --no-daemon --console=plain 2>&1 | tee build.log
 
-      # تشخيص: واش الـ bootstrap تصحّح فعلا؟ (كيطبع محتوى sources.list من كل zip)
+      # تشخيص: واش الـ bootstrap تصحّح فعلا؟
       - name: Verify bootstrap patch
         if: always()
         run: |
-          cd AndroidIDE
+          echo "===== watcher log ====="
+          sort ~/bootstrap-watch.log 2>/dev/null | uniq -c | head -20 || true
           echo "===== PATCHED lines in build.log ====="
-          grep -n "PATCHED\|bootstrap zips found\|patched:" build.log | head -20 || true
-          echo "===== bootstrap-related tasks ====="
-          grep -n -i "bootstrap" build.log | head -15 || true
+          grep -n "PATCHED\|patched:" AndroidIDE/build.log | head -20 || true
           echo "===== bootstrap zips on disk ====="
-          find . -name 'bootstrap-*.zip' -not -path './.git/*' | while read -r z; do
+          cd AndroidIDE
+          find . -name 'bootstrap*.zip' -not -path './.git/*' | while read -r z; do
             echo "== $z"
             unzip -p "$z" etc/apt/sources.list 2>/dev/null || echo "(no etc/apt/sources.list)"
           done
