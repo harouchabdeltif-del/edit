@@ -71,18 +71,20 @@ jobs:
           yes | "$SDKM" --licenses > /dev/null || true
           "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
 
-      # AGP كيفشل فإنشاء debug.keystore (تعارض BouncyCastle: xmss_SHAKE128_512ph)
-      # => نصاوبوه بـ keytool ديال JDK قبل البناء
+      # AGP كيقلب على debug.keystore فـ ~/.config/.android (مماشي ~/.android)
+      # => نصاوبوه بصيغة JKS فجوج المسارات باش يتفادى تعارض BouncyCastle
       - name: Create debug keystore
         run: |
-          mkdir -p ~/.android
-          rm -f ~/.android/debug.keystore
-          keytool -genkeypair -keystore ~/.android/debug.keystore \
-            -storetype JKS \
-            -storepass android -keypass android -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-          ls -la ~/.android
+          for d in "$HOME/.android" "$HOME/.config/.android"; do
+            mkdir -p "$d"
+            rm -f "$d/debug.keystore"
+            keytool -genkeypair -keystore "$d/debug.keystore" \
+              -storetype JKS \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            ls -la "$d"
+          done
 
       - name: Cache Gradle
         uses: actions/cache@v4
