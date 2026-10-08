@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # inject-ai.sh — يحقن وكيل الذكاء الاصطناعي (Agent) مباشرة داخل تطبيق AndroidIDE الرئيسي
+# v3: كل المزوّدين بالمفتاح فقط + جلب الموديلات + Custom كامل + سكرول مصلّح + وكيل ينفّذ مباشرة + واجهة جديدة
 # الاستخدام:   bash inject-ai.sh /path/to/AndroidIDE
 # مع pkg جديد: bash inject-ai.sh /path/to/AndroidIDE inject com.mycompany.androidide.ai
 # للتراجع:     bash inject-ai.sh /path/to/AndroidIDE undo
@@ -53,54 +54,177 @@ package com.itsaky.androidide.ai
 
 import android.content.Context
 
+/**
+ * الإعدادات. المفتاح والموديل والعنوان كيتخزنوا لكل مزوّد على حدة،
+ * وبالتالي تبديل المزوّد ما كيضيّع حتى مفتاح.
+ */
 class AiPrefs(ctx: Context) {
     private val sp = ctx.applicationContext.getSharedPreferences("ai_assistant", Context.MODE_PRIVATE)
 
+    init { migrate() }
+
+    /** ترحيل الإعدادات القديمة (مفتاح واحد) إلى النظام الجديد (مفتاح لكل مزوّد). */
+    private fun migrate() {
+        if (sp.getBoolean("migrated_v2", false)) return
+        val e = sp.edit()
+        if (sp.contains("api_key")) {
+            val pr = sp.getString("provider", "openrouter") ?: "openrouter"
+            e.putString("key_$pr", sp.getString("api_key", "") ?: "")
+            e.putString("model_$pr", sp.getString("model", "") ?: "")
+            e.putString("base_$pr", sp.getString("base_url", "") ?: "")
+        }
+        e.putBoolean("migrated_v2", true).apply()
+    }
+
+    private fun str(k: String): String = sp.getString(k, "") ?: ""
+    private fun put(k: String, v: String) { sp.edit().putString(k, v).apply() }
+
     var provider: String
         get() = sp.getString("provider", "openrouter") ?: "openrouter"
-        set(v) { sp.edit().putString("provider", v).apply() }
+        set(v) { put("provider", v) }
 
+    // ---- قيم خاصة بكل مزوّد
+    fun keyFor(id: String): String = str("key_$id")
+    fun setKeyFor(id: String, v: String) = put("key_$id", v)
+    fun modelFor(id: String): String = str("model_$id")
+    fun setModelFor(id: String, v: String) = put("model_$id", v)
+    fun baseFor(id: String): String = str("base_$id")
+    fun setBaseFor(id: String, v: String) = put("base_$id", v)
+
+    // ---- قيم المزوّد الحالي
     var model: String
-        get() = sp.getString("model", "") ?: ""
-        set(v) { sp.edit().putString("model", v).apply() }
+        get() = modelFor(provider)
+        set(v) { setModelFor(provider, v) }
 
     var apiKey: String
-        get() = sp.getString("api_key", "") ?: ""
-        set(v) { sp.edit().putString("api_key", v).apply() }
+        get() = keyFor(provider)
+        set(v) { setKeyFor(provider, v) }
 
     var baseUrl: String
-        get() = sp.getString("base_url", "") ?: ""
-        set(v) { sp.edit().putString("base_url", v).apply() }
+        get() = baseFor(provider)
+        set(v) { setBaseFor(provider, v) }
+
+    // ---- إعدادات المزوّد المخصص (custom)
+    var customName: String
+        get() = str("custom_name")
+        set(v) { put("custom_name", v) }
+
+    /** openai | anthropic | gemini */
+    var customFormat: String
+        get() = str("custom_format").ifBlank { "openai" }
+        set(v) { put("custom_format", v) }
+
+    /** اسم الـ header ديال المفتاح (فارغ = الافتراضي حسب الصيغة). */
+    var customAuthHeader: String
+        get() = str("custom_auth_header")
+        set(v) { put("custom_auth_header", v) }
+
+    var customAuthPrefix: String
+        get() = str("custom_auth_prefix")
+        set(v) { put("custom_auth_prefix", v) }
+
+    /** headers إضافية: سطر لكل header بالشكل  Name: value */
+    var customHeaders: String
+        get() = str("custom_headers")
+        set(v) { put("custom_headers", v) }
+
+    /** مسار الدردشة (فارغ = الافتراضي حسب الصيغة). يقبل {model} فالـ gemini. */
+    var customChatPath: String
+        get() = str("custom_chat_path")
+        set(v) { put("custom_chat_path", v) }
 
     /** auto | light | dark */
     var theme: String
         get() = sp.getString("theme", "auto") ?: "auto"
-        set(v) { sp.edit().putString("theme", v).apply() }
+        set(v) { put("theme", v) }
 
     /** سجل المحادثة (JSON) باش يبقى حتى بعد إغلاق التطبيق. */
     var history: String
-        get() = sp.getString("history", "") ?: ""
-        set(v) { sp.edit().putString("history", v).apply() }
+        get() = str("history")
+        set(v) { put("history", v) }
 
-    /** true = يطلب تأكيدا قبل كل كتابة/تعديل. الحذف دائما يطلب تأكيدا. */
+    /** true = يطلب تأكيدا قبل كل كتابة/تعديل. الحذف وتنفيذ الأوامر دائما يطلبان تأكيدا. */
     var askBeforeEdit: Boolean
         get() = sp.getBoolean("ask_before_edit", false)
         set(v) { sp.edit().putBoolean("ask_before_edit", v).apply() }
 
-    fun effectiveModel(): String = model.ifBlank {
-        when (provider) {
-            "claude" -> "claude-sonnet-5-5"
-            "openai" -> "gpt-4o-mini"
-            "gemini" -> "gemini-2.5-pro"
-            "openrouter" -> "openrouter/auto"
-            else -> ""
-        }
-    }
+    /** مجلد العمل (فارغ = مجلد المشروع المفتوح، وإلا AndroidIDEProjects). */
+    var workspace: String
+        get() = str("workspace")
+        set(v) { put("workspace", v) }
+
+    fun needsKey(): Boolean = AiProviders.get(provider)?.needsKey ?: true
+
+    fun ready(): Boolean = apiKey.isNotBlank() || !needsKey()
+
+    fun effectiveModel(): String = model.ifBlank { AiProviders.get(provider)?.model.orEmpty() }
+
+    fun providerLabel(): String =
+        if (provider == "custom") customName.ifBlank { "Custom" }
+        else AiProviders.get(provider)?.label?.substringBefore(" (")?.substringBefore(" —") ?: provider
 
     companion object {
-        val PROVIDERS = listOf("openrouter", "openai", "claude", "gemini", "custom")
         val THEMES = listOf("auto", "light", "dark")
     }
+}
+KT_EOF
+
+# ---------------------------------------------------------------- AiProviders.kt
+cat > "$PKG_DIR/AiProviders.kt" <<'KT_EOF'
+package com.itsaky.androidide.ai
+
+/**
+ * سجل المزوّدين. لكل مزوّد: صيغة الـ API + العنوان الجاهز، والمستعمل يدخل المفتاح فقط.
+ * أي مزوّد غير موجود هنا يمكن إضافته عبر "custom" (عنوان + صيغة + headers).
+ */
+object AiProviders {
+
+    /** format = openai (متوافق مع OpenAI) | anthropic | gemini */
+    class Provider(
+        val id: String,
+        val label: String,
+        val format: String,
+        val base: String,
+        val model: String = "",
+        val needsKey: Boolean = true,
+        /** لائحة احتياطية لما ما يكونش عند المزوّد endpoint لجلب الموديلات. */
+        val fallback: List<String> = emptyList()
+    )
+
+    val ALL: List<Provider> = listOf(
+        Provider("openrouter", "OpenRouter (مئات الموديلات)", "openai", "https://openrouter.ai/api/v1", "openrouter/auto"),
+        Provider("openai", "OpenAI (GPT)", "openai", "https://api.openai.com/v1", "gpt-4o-mini"),
+        Provider("claude", "Anthropic (Claude)", "anthropic", "https://api.anthropic.com", "claude-sonnet-5-5"),
+        Provider("gemini", "Google (Gemini)", "gemini", "https://generativelanguage.googleapis.com", "gemini-2.5-pro"),
+        Provider("deepseek", "DeepSeek", "openai", "https://api.deepseek.com/v1", "deepseek-chat"),
+        Provider("groq", "Groq", "openai", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
+        Provider("xai", "xAI (Grok)", "openai", "https://api.x.ai/v1"),
+        Provider("mistral", "Mistral", "openai", "https://api.mistral.ai/v1", "mistral-large-latest"),
+        Provider("together", "Together AI", "openai", "https://api.together.xyz/v1"),
+        Provider("fireworks", "Fireworks AI", "openai", "https://api.fireworks.ai/inference/v1"),
+        Provider("deepinfra", "DeepInfra", "openai", "https://api.deepinfra.com/v1/openai"),
+        Provider("hyperbolic", "Hyperbolic", "openai", "https://api.hyperbolic.xyz/v1"),
+        Provider("cerebras", "Cerebras", "openai", "https://api.cerebras.ai/v1"),
+        Provider("sambanova", "SambaNova", "openai", "https://api.sambanova.ai/v1"),
+        Provider("nvidia", "NVIDIA NIM", "openai", "https://integrate.api.nvidia.com/v1"),
+        Provider("huggingface", "Hugging Face", "openai", "https://router.huggingface.co/v1"),
+        Provider("moonshot", "Moonshot (Kimi)", "openai", "https://api.moonshot.ai/v1"),
+        Provider("zai", "Z.AI (GLM)", "openai", "https://api.z.ai/api/paas/v4"),
+        Provider("qwen", "Alibaba Qwen (DashScope)", "openai", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+        Provider("siliconflow", "SiliconFlow", "openai", "https://api.siliconflow.com/v1"),
+        Provider("cohere", "Cohere", "openai", "https://api.cohere.ai/compatibility/v1"),
+        Provider(
+            "perplexity", "Perplexity", "openai", "https://api.perplexity.ai", "sonar",
+            fallback = listOf("sonar", "sonar-pro", "sonar-reasoning", "sonar-reasoning-pro", "sonar-deep-research")
+        ),
+        Provider("ollama", "Ollama (محلي — بلا مفتاح)", "openai", "http://127.0.0.1:11434/v1", needsKey = false),
+        Provider("lmstudio", "LM Studio (محلي — بلا مفتاح)", "openai", "http://127.0.0.1:1234/v1", needsKey = false),
+        Provider("custom", "Custom — أي مزوّد آخر", "openai", "", needsKey = false)
+    )
+
+    fun get(id: String): Provider? = ALL.firstOrNull { it.id == id }
+
+    fun ids(): List<String> = ALL.map { it.id }
 }
 KT_EOF
 
@@ -112,36 +236,94 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 
-/** عميل HTTP بسيط بلا أي مكتبة خارجية. يدعم: OpenRouter / OpenAI / Claude / Gemini / أي API متوافق مع OpenAI. */
+/**
+ * عميل HTTP بسيط بلا أي مكتبة خارجية.
+ * 3 صيغ: openai (يغطي OpenRouter/OpenAI/Groq/DeepSeek/... وأي خدمة متوافقة) + anthropic + gemini.
+ * كذلك كيجلب لائحة الموديلات ديال أي مزوّد بالمفتاح فقط.
+ */
 object AiClient {
 
     data class Msg(val role: String, val content: String) // role = "user" | "assistant"
 
     class ApiException(val code: Int, message: String) : RuntimeException(message)
 
-    /** كيعاود الطلب حتى 3 مرات فحالة 429 أو أخطاء السيرفر (5xx). */
     private const val NO_NATIVE =
         "\n\nIMPORTANT: Do NOT use native function/tool calling of the API (no browser, no functions, no python). " +
         "Tools exist ONLY as plain-text <tool .../> tags written inside your normal reply."
 
+    /** وجهة الطلب بعد حلّ المزوّد والإعدادات. */
+    private class Endpoint(val format: String, val base: String, val chatPath: String, val headers: Map<String, String>)
+
+    private fun endpoint(p: AiPrefs): Endpoint {
+        val prov = AiProviders.get(p.provider)
+        val custom = p.provider == "custom"
+        val format = if (custom) p.customFormat else (prov?.format ?: "openai")
+        val base = p.baseUrl.ifBlank { prov?.base.orEmpty() }.trim().trimEnd('/')
+        if (base.isBlank()) throw IllegalStateException("خاصك تدخل Base URL فالإعدادات")
+
+        val h = LinkedHashMap<String, String>()
+        val key = p.apiKey
+        val defHeader = when (format) {
+            "anthropic" -> "x-api-key"
+            "gemini" -> "x-goog-api-key"
+            else -> "Authorization"
+        }
+        val defPrefix = if (format == "openai") "Bearer " else ""
+        val own = custom && p.customAuthHeader.isNotBlank()
+        val header = if (own) p.customAuthHeader.trim() else defHeader
+        var prefix = if (own) p.customAuthPrefix else defPrefix
+        if (prefix.isNotEmpty() && prefix.last().isLetterOrDigit()) prefix += " "
+        if (key.isNotBlank()) h[header] = prefix + key
+        if (format == "anthropic" && !h.containsKey("anthropic-version")) h["anthropic-version"] = "2023-06-01"
+        if (custom) {
+            p.customHeaders.lines().forEach { l ->
+                val i = l.indexOf(':')
+                if (i > 0) {
+                    val k = l.substring(0, i).trim()
+                    val v = l.substring(i + 1).trim()
+                    if (k.isNotEmpty()) h[k] = v
+                }
+            }
+        }
+        val path = if (custom && p.customChatPath.isNotBlank()) "/" + p.customChatPath.trim().trimStart('/') else ""
+        return Endpoint(format, base, path, h)
+    }
+
+    private fun geminiRoot(e: Endpoint): String =
+        if (e.base.endsWith("/v1beta") || e.base.endsWith("/v1")) e.base else e.base + "/v1beta"
+
+    private fun chatUrl(e: Endpoint, model: String): String {
+        if (e.chatPath.isNotEmpty()) return e.base + e.chatPath.replace("{model}", model.removePrefix("models/"))
+        return when (e.format) {
+            "anthropic" -> if (e.base.endsWith("/v1")) e.base + "/messages" else e.base + "/v1/messages"
+            "gemini" -> geminiRoot(e) + "/models/" + model.removePrefix("models/") + ":generateContent"
+            else -> e.base + "/chat/completions"
+        }
+    }
+
+    /** كيعاود الطلب حتى 3 مرات فحالة 429 أو أخطاء السيرفر (5xx). */
     fun complete(p: AiPrefs, system: String, msgs: List<Msg>): String {
-        require(p.apiKey.isNotBlank()) { "ضع مفتاح API من الإعدادات" }
+        require(p.ready()) { "ضع مفتاح API من الإعدادات" }
+        val model = p.effectiveModel()
+        require(model.isNotBlank()) { "اختر الموديل من الإعدادات (زر «اختيار»)" }
+        val e = endpoint(p)
         var last: ApiException? = null
         var sys = system
         for (attempt in 0 until 3) {
             try {
-                return when (p.provider) {
-                    "claude" -> claude(p, sys, msgs)
-                    "gemini" -> gemini(p, sys, msgs)
-                    else -> openAiCompatible(p, sys, msgs)
+                return when (e.format) {
+                    "anthropic" -> claude(e, model, sys, msgs)
+                    "gemini" -> gemini(e, model, sys, msgs)
+                    else -> openAi(e, model, sys, msgs)
                 }
-            } catch (e: ApiException) {
+            } catch (ex: ApiException) {
                 // بعض النماذج (مثل gpt-oss) تحاول استدعاء أداة أصلية فيرفضها المزوّد: نعيد الطلب بتذكير صريح
-                val nativeTool = e.code == 400 && (e.message ?: "").contains("tool", ignoreCase = true)
-                if (!nativeTool && e.code != 429 && e.code < 500) throw e
+                val nativeTool = ex.code == 400 && (ex.message ?: "").contains("tool", ignoreCase = true)
+                if (!nativeTool && ex.code != 429 && ex.code < 500) throw ex
                 if (nativeTool) sys = system + NO_NATIVE
-                last = e
+                last = ex
                 if (attempt < 2) Thread.sleep(if (nativeTool) 400L else 1500L * (attempt + 1))
             }
         }
@@ -152,36 +334,51 @@ object AiClient {
     fun ping(p: AiPrefs): String =
         complete(p, "Reply with the single word OK.", listOf(Msg("user", "ping"))).trim().take(40)
 
-    private fun openAiCompatible(p: AiPrefs, system: String, msgs: List<Msg>): String {
-        val base = p.baseUrl.ifBlank {
-            when (p.provider) {
-                "openai" -> "https://api.openai.com/v1"
-                "openrouter" -> "https://openrouter.ai/api/v1"
-                else -> throw IllegalStateException("provider custom خاصو Base URL")
+    // ------------------------------------------------------------------ chat formats
+    private fun textOf(v: Any?): String = when (v) {
+        is String -> v
+        is JSONArray -> buildString {
+            for (i in 0 until v.length()) {
+                val o = v.optJSONObject(i)
+                if (o != null) append(o.optString("text")) else append(v.optString(i))
             }
-        }.trimEnd('/')
+        }
+        else -> ""
+    }
+
+    private fun failIfError(res: JSONObject) {
+        when (val err = res.opt("error")) {
+            is JSONObject -> throw RuntimeException(err.optString("message", "API error"))
+            is String -> if (err.isNotBlank()) throw RuntimeException(err)
+            else -> {}
+        }
+    }
+
+    private fun openAi(e: Endpoint, model: String, system: String, msgs: List<Msg>): String {
         val arr = JSONArray()
         arr.put(JSONObject().put("role", "system").put("content", system))
         msgs.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
-        val body = JSONObject().put("model", p.effectiveModel()).put("messages", arr)
-        val res = JSONObject(post("$base/chat/completions", mapOf("Authorization" to "Bearer ${p.apiKey}"), body))
-        res.optJSONObject("error")?.let { throw RuntimeException(it.optString("message", "API error")) }
-        return res.getJSONArray("choices").getJSONObject(0).getJSONObject("message").optString("content")
+        val body = JSONObject().put("model", model).put("messages", arr)
+        val res = JSONObject(http("POST", chatUrl(e, model), e.headers, body))
+        failIfError(res)
+        val choices = res.optJSONArray("choices")
+            ?: throw RuntimeException("رد غير متوقع من المزوّد: " + res.toString().take(200))
+        val msg = choices.optJSONObject(0)?.optJSONObject("message")
+            ?: throw RuntimeException("رد فارغ من المزوّد: " + res.toString().take(200))
+        return textOf(msg.opt("content"))
     }
 
-    private fun claude(p: AiPrefs, system: String, msgs: List<Msg>): String {
-        val base = p.baseUrl.ifBlank { "https://api.anthropic.com" }.trimEnd('/')
+    private fun claude(e: Endpoint, model: String, system: String, msgs: List<Msg>): String {
         val arr = JSONArray()
         msgs.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
         val body = JSONObject()
-            .put("model", p.effectiveModel())
+            .put("model", model)
             .put("max_tokens", 12000)
             .put("system", system)
             .put("messages", arr)
-        val res = JSONObject(
-            post("$base/v1/messages", mapOf("x-api-key" to p.apiKey, "anthropic-version" to "2023-06-01"), body)
-        )
-        val blocks = res.getJSONArray("content")
+        val res = JSONObject(http("POST", chatUrl(e, model), e.headers, body))
+        failIfError(res)
+        val blocks = res.optJSONArray("content") ?: throw RuntimeException("رد غير متوقع: " + res.toString().take(200))
         return buildString {
             for (i in 0 until blocks.length()) {
                 val b = blocks.getJSONObject(i)
@@ -190,8 +387,7 @@ object AiClient {
         }
     }
 
-    private fun gemini(p: AiPrefs, system: String, msgs: List<Msg>): String {
-        val base = p.baseUrl.ifBlank { "https://generativelanguage.googleapis.com" }.trimEnd('/')
+    private fun gemini(e: Endpoint, model: String, system: String, msgs: List<Msg>): String {
         val contents = JSONArray()
         msgs.forEach {
             contents.put(
@@ -203,13 +399,73 @@ object AiClient {
         val body = JSONObject()
             .put("contents", contents)
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", system))))
-        val res = JSONObject(
-            post("$base/v1beta/models/${p.effectiveModel()}:generateContent", mapOf("x-goog-api-key" to p.apiKey), body)
-        )
-        val parts = res.getJSONArray("candidates").getJSONObject(0).getJSONObject("content").getJSONArray("parts")
+        val res = JSONObject(http("POST", chatUrl(e, model), e.headers, body))
+        failIfError(res)
+        val parts = res.optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")?.optJSONArray("parts")
+            ?: throw RuntimeException("رد فارغ (ربما حجبه فلتر الأمان): " + res.toString().take(200))
         return buildString { for (i in 0 until parts.length()) append(parts.getJSONObject(i).optString("text")) }
     }
 
+    // ------------------------------------------------------------------ models list
+    private fun collectIds(arr: JSONArray?, out: MutableCollection<String>) {
+        if (arr == null) return
+        for (i in 0 until arr.length()) {
+            val o = arr.opt(i)
+            when (o) {
+                is JSONObject -> out.add(o.optString("id").ifBlank { o.optString("name") })
+                is String -> out.add(o)
+            }
+        }
+    }
+
+    /** يجلب كل موديلات المزوّد الحالي بالمفتاح المدخل (OpenAI-compatible / Anthropic / Gemini). */
+    fun listModels(p: AiPrefs): List<String> {
+        require(p.ready()) { "أدخل مفتاح API أولا" }
+        val e = endpoint(p)
+        val out = LinkedHashSet<String>()
+        when (e.format) {
+            "anthropic" -> {
+                val root = if (e.base.endsWith("/v1")) e.base else e.base + "/v1"
+                val res = JSONObject(http("GET", "$root/models?limit=1000", e.headers, null))
+                collectIds(res.optJSONArray("data"), out)
+            }
+            "gemini" -> {
+                var token: String? = null
+                var pages = 0
+                do {
+                    val url = geminiRoot(e) + "/models?pageSize=1000" +
+                        (token?.let { "&pageToken=" + URLEncoder.encode(it, "UTF-8") } ?: "")
+                    val res = JSONObject(http("GET", url, e.headers, null))
+                    val arr = res.optJSONArray("models")
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            val o = arr.getJSONObject(i)
+                            val methods = o.optJSONArray("supportedGenerationMethods")
+                            var ok = methods == null
+                            if (methods != null) {
+                                for (j in 0 until methods.length()) if (methods.optString(j) == "generateContent") ok = true
+                            }
+                            if (ok) out.add(o.optString("name").removePrefix("models/"))
+                        }
+                    }
+                    token = res.optString("nextPageToken").ifBlank { null }
+                    pages++
+                } while (token != null && pages < 5)
+            }
+            else -> {
+                val raw = http("GET", e.base + "/models", e.headers, null).trim()
+                if (raw.startsWith("[")) {
+                    collectIds(JSONArray(raw), out)
+                } else {
+                    val o = JSONObject(raw)
+                    collectIds(o.optJSONArray("data") ?: o.optJSONArray("models"), out)
+                }
+            }
+        }
+        return out.filter { it.isNotBlank() }.sortedBy { it.lowercase() }
+    }
+
+    // ------------------------------------------------------------------ http
     /** يستخرج رسالة الخطأ الحقيقية من رد الـ API بدل ما نعرض JSON خام. */
     private fun errorMessage(raw: String): String {
         val parsed = try {
@@ -223,16 +479,19 @@ object AiClient {
         return parsed.ifBlank { raw.take(300) }
     }
 
-    private fun post(url: String, headers: Map<String, String>, body: JSONObject): String {
+    private fun http(method: String, url: String, headers: Map<String, String>, body: JSONObject?): String {
         val c = URL(url).openConnection() as HttpURLConnection
         try {
-            c.requestMethod = "POST"
+            c.requestMethod = method
             c.connectTimeout = 20_000
-            c.readTimeout = 300_000
-            c.doOutput = true
-            c.setRequestProperty("Content-Type", "application/json")
+            c.readTimeout = if (body != null) 300_000 else 30_000
+            c.setRequestProperty("Accept", "application/json")
             headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
-            c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            if (body != null) {
+                c.doOutput = true
+                c.setRequestProperty("Content-Type", "application/json")
+                c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            }
             val code = c.responseCode
             val stream = if (code in 200..299) c.inputStream else c.errorStream
             val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
@@ -342,10 +601,11 @@ import android.os.Environment
 import android.os.Looper
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
- * منفّذ الأدوات: النموذج يرسل وسوم <tool .../> والوكيل ينفّذها (قراءة/كتابة/تعديل/إنشاء/حذف/نقل/بحث)
- * داخل مجلد العمل فقط، مع إمكانية التراجع عن آخر تنفيذ.
+ * منفّذ الأدوات: النموذج يرسل وسوم <tool .../> والوكيل ينفّذها (قراءة/كتابة/تعديل/إنشاء/حذف/نقل/بحث/تنفيذ أمر)
+ * داخل مجلد العمل أو التخزين المشترك، مع إمكانية التراجع عن آخر تنفيذ.
  */
 object AiAgent {
 
@@ -359,17 +619,17 @@ object AiAgent {
 
     class Run { val undo = mutableListOf<Pair<File, String?>>() }
 
-    /** مجلد العمل: كل المسارات لازم تكون داخله أو داخل مجلد مشاريع AndroidIDE. */
+    /** مجلد العمل: المسارات النسبية كتبدا منو، والمطلقة مسموحة داخل التخزين المشترك (/storage/emulated/0). */
     class Workspace(val root: File, val projects: File) {
         fun resolve(p: String): File {
             val t = p.trim().ifEmpty { "." }
             val f = if (t.startsWith("/")) File(t) else File(root, t)
             val c = f.canonicalFile
-            val ok = listOf(root, projects).any {
+            val ok = listOf(root, projects, Environment.getExternalStorageDirectory()).any {
                 val r = it.canonicalFile
                 c == r || c.path.startsWith(r.path + File.separator)
             }
-            if (!ok) throw SecurityException("المسار خارج مجلد العمل: $p")
+            if (!ok) throw SecurityException("المسار خارج التخزين المسموح: $p")
             return c
         }
 
@@ -383,7 +643,7 @@ object AiAgent {
 
     // ------------------------------------------------------------------ parsing
     private val toolRe = Regex("<tool\\s+([^>]*?)\\s*(?:/>|>([\\s\\S]*?)</tool>)")
-    private val attrRe = Regex("(\\w+)=\"([^\"]*)\"")
+    private val attrRe = Regex("(\\w+)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')")
     private val editRe = Regex("<find>([\\s\\S]*?)</find>\\s*<replace>([\\s\\S]*?)</replace>")
     private val resultRe = Regex("<result ok=\"(true|false)\" label=\"([^\"]*)\">\\r?\\n([\\s\\S]*?)\\r?\\n</result>")
 
@@ -391,7 +651,9 @@ object AiAgent {
         s.removePrefix("\r\n").removePrefix("\n").removeSuffix("\r\n").removeSuffix("\n")
 
     fun parse(reply: String): List<Call> = toolRe.findAll(reply).map { m ->
-        val attrs = attrRe.findAll(m.groupValues[1]).associate { it.groupValues[1] to it.groupValues[2] }
+        val attrs = attrRe.findAll(m.groupValues[1]).associate {
+            it.groupValues[1] to (it.groups[2]?.value ?: it.groups[3]?.value ?: "")
+        }
         Call(attrs["name"].orEmpty(), attrs, trimNl(m.groupValues[2]))
     }.toList()
 
@@ -428,6 +690,7 @@ object AiAgent {
             "delete" -> "حذف $p"
             "move" -> "نقل $p"
             "search" -> "بحث «${c.attrs["query"].orEmpty()}»"
+            "run" -> "تنفيذ أمر: " + c.body.trim().lineSequence().firstOrNull().orEmpty().take(48)
             else -> c.name
         }
     }
@@ -560,10 +823,11 @@ object AiAgent {
             val f = ws.resolve(c.path)
             require(!f.isDirectory) { "هذا مجلد وليس ملفا: ${c.path}" }
             val old = current(a, f)
+            val content = unfence(c.body)
             guard(a, ask, "كتابة ملف", ws.rel(f))
             remember(run, f, old)
-            put(a, f, c.body)
-            (if (old == null) "تم إنشاء " else "تم تحديث ") + ws.rel(f) + " (" + c.body.lines().size + " سطر)"
+            put(a, f, content)
+            (if (old == null) "تم إنشاء " else "تم تحديث ") + ws.rel(f) + " (" + content.lines().size + " سطر)"
         }
 
         "edit_file" -> {
@@ -640,10 +904,70 @@ object AiAgent {
             if (out.isEmpty()) "لا نتائج" else out.joinToString("\n")
         }
 
+        "run" -> {
+            val cmd = c.body.trim().ifEmpty { c.attrs["cmd"].orEmpty().trim() }
+            require(cmd.isNotEmpty()) { "run يحتاج أمرا" }
+            val dir = if (c.attrs["dir"].isNullOrBlank()) ws.root.canonicalFile else ws.resolve(c.attrs["dir"].orEmpty())
+            // تنفيذ الأوامر دائما يطلب تأكيدا مهما كان وضع التنفيذ
+            if (!confirm(a, "تنفيذ أمر", cmd.take(600) + "\n\n(المجلد: " + ws.rel(dir) + ")")) throw Denied()
+            runShell(a, cmd, dir)
+        }
+
         else -> throw IllegalArgumentException("أداة غير معروفة: ${c.name}")
     }
-}
 
+    /** إذا وضع النموذج المحتوى داخل ``` بالغلط، نشيلو باش ما يدخلش فالملف. */
+    private val fenceRe = Regex("^```[A-Za-z0-9_+#.-]*[ \\t]*\\r?\\n([\\s\\S]*?)\\r?\\n?```\\s*$")
+
+    private fun unfence(s: String): String {
+        val t = s.trim()
+        if (!t.startsWith("```")) return s
+        return fenceRe.find(t)?.groupValues?.get(1) ?: s
+    }
+
+    /** ينفّذ أمر shell فمجلد معين (مهلة 120 ثانية). كيستعمل بيئة AndroidIDE (usr/bin) إن وُجدت. */
+    private fun runShell(a: Activity, cmd: String, dir: File): String {
+        dir.mkdirs()
+        val usr = File(a.filesDir, "usr")
+        val bash = File(usr, "bin/bash")
+        val sh = if (bash.canExecute()) bash.path else "/system/bin/sh"
+        val pb = ProcessBuilder(sh, "-c", cmd).directory(dir).redirectErrorStream(true)
+        val env = pb.environment()
+        val bin = File(usr, "bin")
+        if (bin.isDirectory) {
+            env["PATH"] = bin.path + ":" + (env["PATH"] ?: "/system/bin")
+            env["PREFIX"] = usr.path
+            val home = File(a.filesDir, "home")
+            if (home.isDirectory) env["HOME"] = home.path
+        }
+        val proc = pb.start()
+        val out = StringBuffer()
+        val reader = Thread {
+            try {
+                proc.inputStream.bufferedReader().use { r ->
+                    val buf = CharArray(4096)
+                    while (true) {
+                        val n = r.read(buf)
+                        if (n < 0) break
+                        if (out.length < 20000) out.append(buf, 0, n)
+                    }
+                }
+            } catch (t: Throwable) { /* انتهى الـ process */ }
+        }
+        reader.start()
+        val finished = proc.waitFor(120, TimeUnit.SECONDS)
+        if (!finished) {
+            proc.destroyForcibly()
+            reader.join(500)
+            throw IllegalStateException("انتهت المهلة (120 ثانية)\n" + out.toString().trim().take(3000))
+        }
+        reader.join(1500)
+        val text = out.toString().trim().ifEmpty { "(لا مخرجات)" }
+        val code = proc.exitValue()
+        if (code != 0) throw IllegalStateException("exit=$code\n" + text)
+        return "exit=0\n" + text
+    }
+}
 KT_EOF
 
 # ---------------------------------------------------------------- AiChat.kt
@@ -664,15 +988,20 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
 import android.text.InputType
 import android.text.SpannableStringBuilder
 import android.text.Spanned
+import android.text.TextUtils
+import android.text.TextWatcher
 import android.text.style.BackgroundColorSpan
+import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.text.style.TypefaceSpan
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -681,12 +1010,12 @@ import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.PopupMenu
 import android.widget.ProgressBar
-import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.widget.NestedScrollView
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.button.MaterialButton
@@ -699,11 +1028,12 @@ object AiChat {
     @Volatile private var busy = false
     @Volatile private var reqId = 0
     @Volatile private var lastError: String? = null
+    @Volatile private var status: String = ""
     private var onChange: (() -> Unit)? = null
 
     private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
     private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
-    private const val MAX_STEPS = 20
+    private const val MAX_STEPS = 40
 
     private fun notifyChange() { ui.post { onChange?.invoke() } }
 
@@ -741,6 +1071,7 @@ object AiChat {
         val codeBg = Color.parseColor("#0F1015")
         val codeText = Color.parseColor("#E4E4EE")
         val inlineBg = line
+        val okColor = hex("#6FD39A", "#1E8E4E")
     }
 
     private data class Seg(val isCode: Boolean, val text: String, val lang: String = "")
@@ -821,17 +1152,84 @@ object AiChat {
             setOnClickListener { onClick() }
         }
 
-    private fun spinner(a: Activity, p: Pal, items: List<String>, selected: String): Spinner {
-        val ad = object : ArrayAdapter<String>(a, android.R.layout.simple_spinner_dropdown_item, items) {
+    /** عنصر اختيار بشكل بطاقة (بديل Spinner): كيفتح قائمة اختيار نظيفة. */
+    private class Sel(val view: LinearLayout, val label: TextView, var index: Int)
+
+    private fun selector(
+        a: Activity, p: Pal, title: String, items: List<String>, start: Int, onPick: (Int) -> Unit
+    ): Sel {
+        val label = TextView(a).apply {
+            setTextColor(p.text); textSize = 14f; setSingleLine()
+            ellipsize = TextUtils.TruncateAt.END
+            textDirection = View.TEXT_DIRECTION_ANY_RTL
+        }
+        val chevron = ImageView(a).apply {
+            setImageDrawable(icon(a, "ic_ai_chevron"))
+            imageTintList = ColorStateList.valueOf(p.sub)
+        }
+        val view = LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = ripple(outlined(p.surface, dp(a, 14).toFloat(), p.line, dp(a, 1)), dp(a, 14).toFloat())
+            setPadding(dp(a, 16), dp(a, 13), dp(a, 12), dp(a, 13))
+            isClickable = true; isFocusable = true
+            addView(label, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(chevron, LinearLayout.LayoutParams(dp(a, 22), dp(a, 22)))
+        }
+        val sel = Sel(view, label, start.coerceIn(0, (items.size - 1).coerceAtLeast(0)))
+        label.text = items.getOrElse(sel.index) { "" }
+        view.setOnClickListener {
+            AlertDialog.Builder(a)
+                .setTitle(title)
+                .setSingleChoiceItems(items.toTypedArray(), sel.index) { d, which ->
+                    sel.index = which
+                    label.text = items[which]
+                    d.dismiss()
+                    onPick(which)
+                }
+                .show()
+        }
+        return sel
+    }
+
+    /** نافذة اختيار الموديل مع بحث (كتتحمل بلائحة المزوّد كاملة). */
+    private fun pickModel(a: Activity, p: Pal, models: List<String>, onPick: (String) -> Unit) {
+        val shown = ArrayList<String>(models)
+        val ad = object : ArrayAdapter<String>(a, android.R.layout.simple_list_item_1, shown) {
             override fun getView(pos: Int, v: View?, g: ViewGroup): View =
-                (super.getView(pos, v, g) as TextView).apply { setTextColor(p.text) }
-            override fun getDropDownView(pos: Int, v: View?, g: ViewGroup): View =
-                (super.getDropDownView(pos, v, g) as TextView).apply { setTextColor(p.text); setBackgroundColor(p.surface) }
+                (super.getView(pos, v, g) as TextView).apply {
+                    setTextColor(p.text); textSize = 13.5f
+                    textDirection = View.TEXT_DIRECTION_LTR
+                }
         }
-        return Spinner(a).apply {
-            adapter = ad
-            setSelection(items.indexOf(selected).coerceAtLeast(0))
+        val search = EditText(a).apply {
+            hint = "ابحث بين ${models.size} موديل…"
+            setTextColor(p.text); setHintTextColor(p.sub); setSingleLine()
+            textDirection = View.TEXT_DIRECTION_ANY_RTL
         }
+        val lv = ListView(a).apply { adapter = ad }
+        val col = LinearLayout(a).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(a, 20), dp(a, 8), dp(a, 20), 0)
+            addView(search, LinearLayout.LayoutParams(MATCH, WRAP))
+            addView(lv, LinearLayout.LayoutParams(MATCH, dp(a, 380)))
+        }
+        val dlg = AlertDialog.Builder(a).setTitle("اختر الموديل").setView(col).setNegativeButton("إغلاق", null).create()
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, af: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {
+                val q = s?.toString().orEmpty().trim()
+                ad.clear()
+                ad.addAll(if (q.isEmpty()) models else models.filter { it.contains(q, ignoreCase = true) })
+                ad.notifyDataSetChanged()
+            }
+            override fun afterTextChanged(s: Editable?) {}
+        })
+        lv.setOnItemClickListener { _, _, pos, _ ->
+            ad.getItem(pos)?.let { onPick(it) }
+            dlg.dismiss()
+        }
+        dlg.show()
     }
 
     /** يضبط BottomSheetDialog: يتمدد لأعلى الشاشة، بلا حالة مطوية، والخلفية ديال المحتوى هي اللي كتبان. */
@@ -852,8 +1250,8 @@ object AiChat {
         }
         dialog.behavior.apply {
             skipCollapsed = true
-            isFitToContents = false
-            expandedOffset = off
+            // ارتفاع الـ sheet ثابت (النافذة - الهامش)، فنستعمل fitToContents باش ما يبقاش HALF_EXPANDED كيخبّي خانة الكتابة
+            isFitToContents = true
             state = BottomSheetBehavior.STATE_EXPANDED
         }
     }
@@ -921,6 +1319,8 @@ object AiChat {
         val prefs = AiPrefs(a)
         val p = pal(a)
         val dialog = BottomSheetDialog(a)
+        val rtl = a.resources.configuration.layoutDirection == View.LAYOUT_DIRECTION_RTL
+        var stickNext = false
 
         fun toast(s: String, long: Boolean = false) =
             Toast.makeText(a, s, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
@@ -940,16 +1340,48 @@ object AiChat {
             else c.getItemAt(0).coerceToText(a)?.toString()?.trim()?.takeIf { it.isNotEmpty() }
         } catch (t: Throwable) { null }
 
+        // ---- القائمة (NestedScrollView + منع الـ BottomSheet من سرقة اللمسات = السكرول يخدم)
         val list = LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(a, 4), 0, dp(a, 4))
+            setPadding(0, dp(a, 8), 0, dp(a, 8))
         }
-        val scroll = ScrollView(a).apply { addView(list); isVerticalScrollBarEnabled = false }
-        val send = iconButton(a, "ic_ai_send", "إرسال", p.onAccent, p.accent, 44) { }
+        val scroll = NestedScrollView(a).apply {
+            addView(list)
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isNestedScrollingEnabled = true
+            setOnTouchListener { v, ev ->
+                if (ev.action == MotionEvent.ACTION_DOWN || ev.action == MotionEvent.ACTION_MOVE) {
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
+                }
+                false
+            }
+        }
+
+        val input = EditText(a).apply {
+            hint = "اكتب أمرك…"
+            setTextColor(p.text); setHintTextColor(p.sub)
+            textSize = 15f
+            background = outlined(p.surface, dp(a, 26).toFloat(), p.line, dp(a, 1))
+            setPadding(dp(a, 18), dp(a, 12), dp(a, 18), dp(a, 12))
+            maxLines = 5
+            textDirection = View.TEXT_DIRECTION_ANY_RTL
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        val send = iconButton(a, "ic_ai_send", "إرسال", p.onAccent, p.accent, 48) { }
+        if (rtl) send.scaleX = -1f
         fun updateSend() {
             send.setImageDrawable(icon(a, if (busy) "ic_ai_stop" else "ic_ai_send"))
             send.contentDescription = if (busy) "إيقاف" else "إرسال"
+            send.alpha = if (busy || input.text.isNotBlank()) 1f else 0.5f
         }
+        input.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, af: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {
+                send.alpha = if (busy || !s.isNullOrBlank()) 1f else 0.5f
+            }
+            override fun afterTextChanged(s: Editable?) {}
+        })
 
         // ---- تطبيق الكود على المحرر
         fun doInsert(code: String) {
@@ -976,31 +1408,32 @@ object AiChat {
         fun codeView(s: Seg): View {
             val box = LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL
-                background = shape(p.codeBg, dp(a, 12).toFloat())
-                setPadding(dp(a, 10), dp(a, 6), dp(a, 10), dp(a, 8))
+                background = shape(p.codeBg, dp(a, 14).toFloat())
+                setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 10))
             }
             val bar = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
             bar.addView(TextView(a).apply {
-                text = s.lang.ifBlank { "code" }; setTextColor(Color.parseColor("#8A8A9A")); textSize = 11f
+                text = s.lang.ifBlank { "code" }; setTextColor(Color.parseColor("#8A8A9A")); textSize = 11.5f
+                typeface = Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR
             }, LinearLayout.LayoutParams(0, WRAP, 1f))
             fun mini(label: String, f: () -> Unit) {
                 bar.addView(TextView(a).apply {
-                    text = label; textSize = 11f; setTextColor(p.codeText); gravity = Gravity.CENTER
-                    setPadding(dp(a, 10), dp(a, 5), dp(a, 10), dp(a, 5))
+                    text = label; textSize = 11.5f; setTextColor(p.codeText); gravity = Gravity.CENTER
+                    setPadding(dp(a, 12), dp(a, 6), dp(a, 12), dp(a, 6))
                     background = ripple(shape(Color.parseColor("#2A2A34"), dp(a, 14).toFloat()), dp(a, 14).toFloat())
                     isClickable = true; isFocusable = true
                     setOnClickListener { f() }
-                }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 4) })
+                }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 6) })
             }
             mini("نسخ") { copy(s.text) }
             mini("إدراج") { doInsert(s.text) }
             mini("استبدال") { doReplace(s.text) }
 
             val tv = TextView(a).apply {
-                text = s.text; setTextColor(p.codeText); textSize = 12f; typeface = Typeface.MONOSPACE
+                text = s.text; setTextColor(p.codeText); textSize = 12.5f; typeface = Typeface.MONOSPACE
                 setTextIsSelectable(true); textDirection = View.TEXT_DIRECTION_LTR
                 setHorizontallyScrolling(true)
-                setPadding(0, dp(a, 6), 0, 0)
+                setPadding(0, dp(a, 8), 0, 0)
             }
             val hs = HorizontalScrollView(a).apply {
                 addView(tv); isHorizontalScrollBarEnabled = false; layoutDirection = View.LAYOUT_DIRECTION_LTR
@@ -1012,24 +1445,50 @@ object AiChat {
 
         fun itemParams(mine: Boolean) = LinearLayout.LayoutParams(if (mine) WRAP else MATCH, WRAP).apply {
             gravity = if (mine) Gravity.END else Gravity.START
-            bottomMargin = dp(a, 8)
-            if (mine) { marginStart = dp(a, 40) } else { marginEnd = dp(a, 16) }
+            bottomMargin = dp(a, 10)
+            if (mine) { marginStart = dp(a, 48) } else { marginEnd = dp(a, 12) }
+        }
+
+        /** فقاعة بذيل صغير: الذيل كيتبدل حسب اتجاه الواجهة (LTR/RTL). */
+        fun bubbleShape(color: Int, mine: Boolean): GradientDrawable {
+            val big = dp(a, 20).toFloat()
+            val small = dp(a, 6).toFloat()
+            val tailRight = (mine && !rtl) || (!mine && rtl)
+            val radii = if (tailRight) floatArrayOf(big, big, big, big, small, small, big, big)
+            else floatArrayOf(big, big, big, big, big, big, small, small)
+            return GradientDrawable().apply { setColor(color); cornerRadii = radii }
         }
 
         /** بطاقة نشاط الوكيل: كل أداة نفّذها (✓ نجحت / ✗ فشلت). */
         fun activity(m: AiClient.Msg): View {
+            val items = AiAgent.parseResults(m.content)
             val col = LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL
-                background = outlined(Color.TRANSPARENT, dp(a, 14).toFloat(), p.line, dp(a, 1))
-                setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 8))
+                background = outlined(Color.TRANSPARENT, dp(a, 16).toFloat(), p.line, dp(a, 1))
+                setPadding(dp(a, 14), dp(a, 10), dp(a, 14), dp(a, 10))
             }
-            AiAgent.parseResults(m.content).forEach { (ok, label, detail) ->
+            col.addView(TextView(a).apply {
+                text = "الإجراءات · ${items.size}"
+                setTextColor(p.sub); textSize = 11.5f; typeface = Typeface.DEFAULT_BOLD
+                setPadding(0, 0, 0, dp(a, 4))
+            })
+            items.forEach { (ok, label, detail) ->
+                val sb = SpannableStringBuilder()
+                sb.append(if (ok) "✓" else "✗")
+                sb.setSpan(ForegroundColorSpan(if (ok) p.okColor else p.danger), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.setSpan(StyleSpan(Typeface.BOLD), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.append("   ").append(label)
+                if (!ok && detail.isNotBlank()) {
+                    val st = sb.length
+                    sb.append("\n      ").append(detail.take(160))
+                    sb.setSpan(ForegroundColorSpan(p.danger), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
                 col.addView(TextView(a).apply {
-                    text = (if (ok) "✓  " else "✗  ") + label + (if (!ok && detail.isNotBlank()) "\n    " + detail.take(160) else "")
-                    textSize = 12.5f
-                    setTextColor(if (ok) p.sub else p.danger)
+                    text = sb
+                    textSize = 13f
+                    setTextColor(p.text)
                     textDirection = View.TEXT_DIRECTION_ANY_RTL
-                    setPadding(0, dp(a, 2), 0, dp(a, 2))
+                    setPadding(0, dp(a, 3), 0, dp(a, 3))
                 })
             }
             col.layoutParams = itemParams(false)
@@ -1043,25 +1502,31 @@ object AiChat {
             if (body.isBlank()) return null
             val col = LinearLayout(a).apply {
                 orientation = LinearLayout.VERTICAL
-                background = shape(if (mine) p.accentBox else p.surface, dp(a, 18).toFloat())
-                setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 8))
+                background = bubbleShape(if (mine) p.accentBox else p.surface, mine)
+                setPadding(dp(a, 14), dp(a, 10), dp(a, 14), dp(a, 10))
             }
             if (mine) {
                 col.addView(TextView(a).apply {
-                    text = body; setTextColor(p.onAccentBox); textSize = 14f
+                    text = body; setTextColor(p.onAccentBox); textSize = 15f
+                    setLineSpacing(0f, 1.2f)
+                    maxWidth = (a.resources.displayMetrics.widthPixels * 0.78f).toInt()
                     setTextIsSelectable(true); textDirection = View.TEXT_DIRECTION_ANY_RTL
                 })
             } else {
+                var first = true
                 for (s in parse(body)) {
+                    val gap = if (first) 0 else dp(a, 6)
+                    first = false
                     if (s.isCode) {
                         col.addView(codeView(s), LinearLayout.LayoutParams(MATCH, WRAP).apply {
-                            topMargin = dp(a, 4); bottomMargin = dp(a, 4)
+                            topMargin = maxOf(gap, dp(a, 4)); bottomMargin = dp(a, 4)
                         })
                     } else {
                         col.addView(TextView(a).apply {
-                            text = md(p, s.text); setTextColor(p.text); textSize = 14f
+                            text = md(p, s.text); setTextColor(p.text); textSize = 15f
+                            setLineSpacing(0f, 1.2f)
                             setTextIsSelectable(true); textDirection = View.TEXT_DIRECTION_ANY_RTL
-                        })
+                        }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = gap })
                     }
                 }
             }
@@ -1071,52 +1536,96 @@ object AiChat {
 
         fun working(): View = LinearLayout(a).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-            background = shape(p.surface, dp(a, 16).toFloat())
-            setPadding(dp(a, 14), dp(a, 10), dp(a, 14), dp(a, 10))
+            background = shape(p.surface, dp(a, 18).toFloat())
+            setPadding(dp(a, 14), dp(a, 11), dp(a, 16), dp(a, 11))
             addView(ProgressBar(a).apply {
                 isIndeterminate = true; indeterminateTintList = ColorStateList.valueOf(p.accent)
             }, LinearLayout.LayoutParams(dp(a, 18), dp(a, 18)))
             addView(TextView(a).apply {
-                text = "جارٍ العمل…"; setTextColor(p.sub); textSize = 13f; setPadding(dp(a, 8), 0, 0, 0)
-            })
-            layoutParams = itemParams(false).apply { marginEnd = 0 }
+                text = status.ifBlank { "جارٍ العمل…" }
+                setTextColor(p.sub); textSize = 13.5f; setPadding(dp(a, 10), 0, 0, 0)
+                setSingleLine(); ellipsize = TextUtils.TruncateAt.END
+                textDirection = View.TEXT_DIRECTION_ANY_RTL
+            }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            layoutParams = itemParams(false).apply { marginEnd = dp(a, 48) }
         }
 
-        fun notice(text: String): View = TextView(a).apply {
-            this.text = text; setTextColor(p.sub); textSize = 13f; gravity = Gravity.CENTER
-            textDirection = View.TEXT_DIRECTION_ANY_RTL
-            setPadding(dp(a, 12), dp(a, 24), dp(a, 12), dp(a, 24))
-            layoutParams = LinearLayout.LayoutParams(MATCH, WRAP)
+        fun errorCard(e: String): View = LinearLayout(a).apply {
+            orientation = LinearLayout.VERTICAL
+            background = shape(p.danger, dp(a, 16).toFloat())
+            setPadding(dp(a, 14), dp(a, 10), dp(a, 14), dp(a, 12))
+            addView(TextView(a).apply {
+                text = "تعذّر إتمام الطلب"; setTextColor(p.onDanger); textSize = 13.5f; typeface = Typeface.DEFAULT_BOLD
+            })
+            addView(TextView(a).apply {
+                text = e; setTextColor(p.onDanger); textSize = 12.5f; setTextIsSelectable(true)
+                setPadding(0, dp(a, 4), 0, 0)
+            })
+            layoutParams = itemParams(false)
+        }
+
+        fun emptyState(): View {
+            val col = LinearLayout(a).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(a, 4), dp(a, 28), dp(a, 4), dp(a, 8))
+                layoutParams = LinearLayout.LayoutParams(MATCH, WRAP)
+            }
+            col.addView(iconButton(a, "ic_ai_sparkle", "", p.onAccentBox, p.accentBox, 64) { }.apply { isClickable = false },
+                LinearLayout.LayoutParams(dp(a, 64), dp(a, 64)))
+            col.addView(TextView(a).apply {
+                text = "وكيلك البرمجي جاهز"; setTextColor(p.text); textSize = 20f
+                typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = dp(a, 16) })
+            col.addView(TextView(a).apply {
+                text = "اكتب أمرا بسيطا وسأنفّذه مباشرة: مجلدات، ملفات، شاشات ومشاريع كاملة، أو تعديل الملف المفتوح."
+                setTextColor(p.sub); textSize = 13.5f; gravity = Gravity.CENTER; setLineSpacing(0f, 1.25f)
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(a, 6); bottomMargin = dp(a, 20) })
+            listOf(
+                "أنشئ مجلدا باسم login وضع فيه واجهة تسجيل دخول كاملة",
+                "أنشئ مشروع أندرويد جديد باسم Notes",
+                "أضف زر حفظ في الملف المفتوح"
+            ).forEach { ex ->
+                col.addView(TextView(a).apply {
+                    text = ex; setTextColor(p.text); textSize = 13.5f
+                    textDirection = View.TEXT_DIRECTION_ANY_RTL
+                    background = ripple(outlined(Color.TRANSPARENT, dp(a, 16).toFloat(), p.line, dp(a, 1)), dp(a, 16).toFloat())
+                    setPadding(dp(a, 16), dp(a, 12), dp(a, 16), dp(a, 12))
+                    isClickable = true; isFocusable = true
+                    setOnClickListener {
+                        input.setText(ex); input.setSelection(input.text.length); input.requestFocus()
+                    }
+                }, LinearLayout.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(a, 8) })
+            }
+            return col
+        }
+
+        fun nearBottom(): Boolean {
+            val c = scroll.getChildAt(0) ?: return true
+            return c.bottom - (scroll.scrollY + scroll.height) < dp(a, 96)
         }
 
         fun render() {
+            // ما نسحبوش المستعمل لتحت إلا إلا كان قريب من آخر المحادثة (باش يقدر يقرا القديم وهو الوكيل خدّام)
+            val stick = stickNext || nearBottom()
+            stickNext = false
             list.removeAllViews()
-            if (AiPlugin.history.isEmpty() && !busy) {
-                list.addView(notice("أنا وكيل برمجي: أعطني أمرا وأنا أنفّذه.\nمثال: أنشئ مشروع أندرويد جديد باسم Notes مع شاشة رئيسية\nأو: أضف زر تسجيل الدخول في هذا الملف"))
-            }
+            if (AiPlugin.history.isEmpty() && !busy) list.addView(emptyState())
             AiPlugin.history.forEach { m -> bubble(m)?.let { list.addView(it) } }
             if (busy) list.addView(working())
-            lastError?.let { e ->
-                list.addView(TextView(a).apply {
-                    text = "تعذّر إتمام الطلب\n$e"; setTextColor(p.onDanger); textSize = 13f
-                    setTextIsSelectable(true)
-                    background = shape(p.danger, dp(a, 14).toFloat())
-                    setPadding(dp(a, 12), dp(a, 8), dp(a, 12), dp(a, 8))
-                    layoutParams = itemParams(false)
-                })
-            }
-            scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+            lastError?.let { e -> list.addView(errorCard(e)) }
+            if (stick) scroll.post { scroll.scrollTo(0, list.height) }
         }
 
         // ---- الإرسال / الإيقاف
         fun ask(prompt: String) {
             if (busy) return
-            if (prefs.apiKey.isBlank()) { toast("ضع مفتاح API أولا", true); showSettings(a); return }
+            if (!prefs.ready()) { toast("ضع مفتاح API أولا", true); showSettings(a); return }
+            stickNext = true
             startRun(a, prompt)
         }
 
         fun cancel() {
-            reqId++; busy = false
+            reqId++; busy = false; status = ""
             val last = AiPlugin.history.lastOrNull()
             if (last != null && last.role == "user" && !AiAgent.isResults(last)) AiPlugin.history.removeAt(AiPlugin.history.lastIndex)
             AiPlugin.save(a)
@@ -1127,15 +1636,22 @@ object AiChat {
         val header = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val titles = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
         titles.addView(TextView(a).apply {
-            text = "مساعد الذكاء الاصطناعي"; setTextColor(p.text); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
+            text = "مساعد الذكاء الاصطناعي"; setTextColor(p.text); textSize = 17f; typeface = Typeface.DEFAULT_BOLD
         })
-        titles.addView(TextView(a).apply {
-            text = prefs.provider + " · " + prefs.effectiveModel().ifBlank { "—" }
-            setTextColor(p.sub); textSize = 11f; setSingleLine(); textDirection = View.TEXT_DIRECTION_LTR
-        })
-        val avatar = iconButton(a, "ic_ai_sparkle", "", p.onAccentBox, p.accentBox, 40) { }
+        val subtitle = TextView(a).apply {
+            setTextColor(p.sub); textSize = 12f; setSingleLine(); ellipsize = TextUtils.TruncateAt.END
+            textDirection = View.TEXT_DIRECTION_LTR
+            setPadding(0, dp(a, 2), 0, dp(a, 2))
+            isClickable = true; isFocusable = true
+            setOnClickListener { showSettings(a) }
+        }
+        titles.addView(subtitle)
+        fun updateSubtitle() {
+            subtitle.text = prefs.providerLabel() + " · " + prefs.effectiveModel().ifBlank { "اختر موديل" } + "  ›"
+        }
+        val avatar = iconButton(a, "ic_ai_sparkle", "", p.onAccentBox, p.accentBox, 42) { }
         avatar.isClickable = false
-        val more = iconButton(a, "ic_ai_more", "المزيد", p.sub, Color.TRANSPARENT, 40) { }
+        val more = iconButton(a, "ic_ai_more", "المزيد", p.sub, Color.TRANSPARENT, 42) { }
         more.setOnClickListener { v ->
             val pm = PopupMenu(a, v)
             pm.menu.add(0, 1, 0, "الإعدادات")
@@ -1151,32 +1667,28 @@ object AiChat {
             }
             pm.show()
         }
-        val close = iconButton(a, "ic_ai_close", "إغلاق", p.sub, Color.TRANSPARENT, 40) { dialog.dismiss() }
-        header.addView(avatar, LinearLayout.LayoutParams(dp(a, 40), dp(a, 40)).apply { marginEnd = dp(a, 12) })
+        val close = iconButton(a, "ic_ai_close", "إغلاق", p.sub, Color.TRANSPARENT, 42) { dialog.dismiss() }
+        header.addView(avatar, LinearLayout.LayoutParams(dp(a, 42), dp(a, 42)).apply { marginEnd = dp(a, 12) })
         header.addView(titles, LinearLayout.LayoutParams(0, WRAP, 1f))
-        header.addView(more, LinearLayout.LayoutParams(dp(a, 40), dp(a, 40)))
-        header.addView(close, LinearLayout.LayoutParams(dp(a, 40), dp(a, 40)))
+        header.addView(more, LinearLayout.LayoutParams(dp(a, 42), dp(a, 42)))
+        header.addView(close, LinearLayout.LayoutParams(dp(a, 42), dp(a, 42)))
 
         // ---- اقتراحات سريعة (Material Chips)
-        val input = EditText(a).apply {
-            hint = "اكتب أمرك…"; setTextColor(p.text); setHintTextColor(p.sub)
-            background = shape(p.surface, dp(a, 24).toFloat())
-            setPadding(dp(a, 16), dp(a, 10), dp(a, 16), dp(a, 10))
-            maxLines = 4; textSize = 14f
-            textDirection = View.TEXT_DIRECTION_ANY_RTL
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-        }
         val chipsRow = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
         fun chip(label: String, onClick: () -> Unit) {
             chipsRow.addView(Chip(a).apply {
-                text = label; setTextColor(p.text); isCheckable = false
+                text = label; setTextColor(p.text); textSize = 12.5f; isCheckable = false
+                chipBackgroundColor = ColorStateList.valueOf(p.surface)
+                chipStrokeColor = ColorStateList.valueOf(p.line)
+                chipStrokeWidth = dp(a, 1).toFloat()
                 setOnClickListener { onClick() }
             }, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = dp(a, 6) })
         }
-        chip("مشروع جديد") {
-            input.setText("أنشئ مشروع أندرويد جديد باسم ")
-            input.setSelection(input.text.length); input.requestFocus()
+        fun prefill(text: String) {
+            input.setText(text); input.setSelection(input.text.length); input.requestFocus()
         }
+        chip("مشروع جديد") { prefill("أنشئ مشروع أندرويد جديد باسم ") }
+        chip("مجلد + واجهة") { prefill("أنشئ مجلدا باسم ") }
         chip("أصلح الملف") { ask("أصلح الأخطاء في الملف المفتوح وطبّق الإصلاح مباشرة.") }
         chip("اشرح الملف") { ask("اشرح لي هذا الملف باختصار.") }
         chip("حسّن الكود") { ask("حسّن جودة وقراءة الكود (التحديد إن وُجد، وإلا الملف) دون تغيير السلوك، وطبّق التعديل مباشرة.") }
@@ -1194,9 +1706,9 @@ object AiChat {
             val t = input.text.toString().trim()
             if (t.isNotEmpty()) { input.text.clear(); ask(t) }
         }
-        val inputRow = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val inputRow = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.BOTTOM }
         inputRow.addView(input, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginEnd = dp(a, 8) })
-        inputRow.addView(send, LinearLayout.LayoutParams(dp(a, 44), dp(a, 44)))
+        inputRow.addView(send, LinearLayout.LayoutParams(dp(a, 48), dp(a, 48)))
 
         // ---- التجميع
         val root = LinearLayout(a).apply {
@@ -1205,15 +1717,17 @@ object AiChat {
             background = sheetBackground(a, p)
         }
         root.addView(View(a).apply { background = shape(p.line, dp(a, 2).toFloat()) },
-            LinearLayout.LayoutParams(dp(a, 32), dp(a, 4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(a, 10) })
+            LinearLayout.LayoutParams(dp(a, 36), dp(a, 4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(a, 10) })
         root.addView(header)
-        root.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f).apply { topMargin = dp(a, 8) })
-        root.addView(chips, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(a, 6); bottomMargin = dp(a, 8) })
+        root.addView(View(a).apply { setBackgroundColor(p.line) },
+            LinearLayout.LayoutParams(MATCH, dp(a, 1)).apply { topMargin = dp(a, 10) })
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        root.addView(chips, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(a, 4); bottomMargin = dp(a, 10) })
         root.addView(inputRow)
 
-        onChange = { updateSend(); render() }
+        onChange = { updateSend(); updateSubtitle(); render() }
         dialog.setOnDismissListener { onChange = null }
-        updateSend(); render()
+        updateSend(); updateSubtitle(); render()
         setupSheet(a, dialog, root, 56)
         dialog.show()
     }
@@ -1223,13 +1737,17 @@ object AiChat {
         val prefs = AiPrefs(a)
         lastError = null
         val ed = EditorAccess.find(a)
-        val ws = AiAgent.Workspace(projectRoot(ed?.file()) ?: AiAgent.projectsDir(), AiAgent.projectsDir())
+        val custom = prefs.workspace.trim()
+        val root = if (custom.isNotEmpty()) File(custom) else (projectRoot(ed?.file()) ?: AiAgent.projectsDir())
+        runCatching { root.mkdirs() }
+        val ws = AiAgent.Workspace(root, AiAgent.projectsDir())
         val system = buildSystem(ed, ws)
         val first = buildPrompt(prompt, ed)
         val runStart = AiPlugin.history.size
         AiPlugin.history.add(AiClient.Msg("user", prompt))
         val my = ++reqId
         busy = true
+        status = "يفكّر…"
         notifyChange()
 
         Thread {
@@ -1243,6 +1761,8 @@ object AiChat {
                     val older = snap.subList(0, cut).takeLast(10).dropWhile { it.role != "user" }.map { AiAgent.compact(it) }
                     val cur = snap.subList(cut, snap.size).toMutableList()
                     if (cur.isNotEmpty()) cur[0] = AiClient.Msg("user", first)
+                    status = if (step == 0) "يفكّر…" else "يراجع النتائج…"
+                    notifyChange()
                     val reply = AiClient.complete(prefs, system, older + cur)
                     if (my != reqId) break
                     AiPlugin.history.add(AiClient.Msg("assistant", reply))
@@ -1256,6 +1776,8 @@ object AiChat {
                         AiPlugin.history.add(AiClient.Msg("assistant", "توقفت بعد $MAX_STEPS خطوة. اكتب «تابع» لإكمال العمل."))
                         break
                     }
+                    status = AiAgent.describe(calls.first()) + (if (calls.size > 1) "  (+" + (calls.size - 1) + ")" else "")
+                    notifyChange()
                     val results = calls.map { AiAgent.execute(a, run, ws, it, prefs.askBeforeEdit) }
                     if (my != reqId) break
                     AiPlugin.history.add(AiClient.Msg("user", AiAgent.formatResults(results)))
@@ -1268,6 +1790,7 @@ object AiChat {
             ui.post {
                 if (my == reqId) {
                     busy = false
+                    status = ""
                     if (err != null) {
                         val last = AiPlugin.history.lastOrNull()
                         if (AiPlugin.history.size == runStart + 1 && last != null && last.role == "user") {
@@ -1288,69 +1811,265 @@ object AiChat {
         val p = pal(a)
         val dialog = BottomSheetDialog(a)
 
-        fun label(t: String) = TextView(a).apply {
-            text = t; setTextColor(p.sub); textSize = 12f; setPadding(0, dp(a, 14), 0, dp(a, 4))
+        fun toast(s: String, long: Boolean = false) =
+            Toast.makeText(a, s, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+
+        fun section(t: String) = TextView(a).apply {
+            text = t; setTextColor(p.sub); textSize = 12f; typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(a, 4), dp(a, 20), dp(a, 4), dp(a, 6))
         }
-        fun field(h: String, v: String, pass: Boolean = false) = EditText(a).apply {
-            hint = h; setText(v); setTextColor(p.text); setHintTextColor(p.sub); setSingleLine()
-            background = shape(p.surface, dp(a, 12).toFloat())
-            setPadding(dp(a, 14), dp(a, 12), dp(a, 14), dp(a, 12))
-            inputType = if (pass) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_CLASS_TEXT
+        fun note(t: String) = TextView(a).apply {
+            text = t; setTextColor(p.sub); textSize = 11.5f; setLineSpacing(0f, 1.2f)
+            setPadding(dp(a, 4), dp(a, 6), dp(a, 4), 0)
+        }
+        fun field(h: String, v: String, pass: Boolean = false, multi: Boolean = false, uri: Boolean = false) =
+            EditText(a).apply {
+                hint = h; setText(v); setTextColor(p.text); setHintTextColor(p.sub)
+                textSize = 14f
+                background = outlined(p.surface, dp(a, 14).toFloat(), p.line, dp(a, 1))
+                setPadding(dp(a, 16), dp(a, 13), dp(a, 16), dp(a, 13))
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                if (multi) {
+                    minLines = 3
+                    gravity = Gravity.TOP or Gravity.START
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                } else {
+                    setSingleLine()
+                    inputType = when {
+                        pass -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                        uri -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                        else -> InputType.TYPE_CLASS_TEXT
+                    }
+                }
+            }
+
+        val ids = AiProviders.ids()
+        val labels = AiProviders.ALL.map { it.label }
+        var cur = prefs.provider.let { if (ids.contains(it)) it else "openrouter" }
+
+        val key = field("API Key", "", pass = true)
+        val model = field("", "")
+        val base = field("", "", uri = true)
+        val providerNote = note("")
+
+        // ---- حقول المزوّد المخصص (custom)
+        val formats = listOf("openai", "anthropic", "gemini")
+        val cName = field("اسم المزوّد (للعرض فقط)", prefs.customName)
+        val cFormat = selector(
+            a, p, "صيغة الـ API",
+            listOf("OpenAI-compatible (الأشهر)", "Anthropic Messages", "Google Gemini"),
+            formats.indexOf(prefs.customFormat)
+        ) { }
+        val cAuthHeader = field("Authorization", prefs.customAuthHeader)
+        val cAuthPrefix = field("Bearer ", prefs.customAuthPrefix)
+        val cHeaders = field("X-Header: value", prefs.customHeaders, multi = true)
+        val cPath = field("/chat/completions", prefs.customChatPath)
+        val custom = LinearLayout(a).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(section("اسم المزوّد")); addView(cName)
+            addView(section("صيغة الـ API")); addView(cFormat.view)
+            addView(section("Header ديال المفتاح (اختياري)")); addView(cAuthHeader)
+            addView(note("فارغ = الافتراضي حسب الصيغة (Authorization مع Bearer، أو x-api-key فـ Anthropic)."))
+            addView(section("بادئة المفتاح (اختياري)")); addView(cAuthPrefix)
+            addView(section("Headers إضافية (سطر لكل header)")); addView(cHeaders)
+            addView(section("مسار الدردشة (اختياري)")); addView(cPath)
+            addView(note("فارغ = المسار الافتراضي حسب الصيغة. فـ Gemini تقدر تكتب {model} داخل المسار."))
+        }
+        val advanced = LinearLayout(a).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(section("العنوان (Base URL)")); addView(base)
+            addView(custom)
+        }
+        val advToggle = TextView(a).apply {
+            text = "خيارات متقدمة  ▾"; setTextColor(p.accent); textSize = 13f
+            setPadding(dp(a, 4), dp(a, 20), dp(a, 4), dp(a, 4))
+            isClickable = true; isFocusable = true
+            setOnClickListener {
+                val opening = advanced.visibility != View.VISIBLE
+                advanced.visibility = if (opening) View.VISIBLE else View.GONE
+                text = if (opening) "خيارات متقدمة  ▴" else "خيارات متقدمة  ▾"
+            }
         }
 
+        fun load(id: String) {
+            val pr = AiProviders.get(id)
+            key.setText(prefs.keyFor(id))
+            model.setText(prefs.modelFor(id))
+            base.setText(prefs.baseFor(id))
+            val defBase = pr?.base.orEmpty()
+            base.hint = if (defBase.isBlank()) "https://example.com/v1" else defBase
+            val defModel = pr?.model.orEmpty()
+            model.hint = if (defModel.isBlank()) "اكتب اسم الموديل أو اضغط «اختيار»" else defModel
+            val isCustom = id == "custom"
+            custom.visibility = if (isCustom) View.VISIBLE else View.GONE
+            advToggle.visibility = if (isCustom) View.GONE else View.VISIBLE
+            if (isCustom) {
+                advanced.visibility = View.VISIBLE
+            } else {
+                advanced.visibility = View.GONE
+                advToggle.text = "خيارات متقدمة  ▾"
+            }
+            providerNote.text = when {
+                isCustom -> "مزوّد مخصص: أدخل Base URL (فالخيارات المتقدمة) + الصيغة + المفتاح + اسم الموديل. يدعم أي خدمة."
+                pr != null && !pr.needsKey -> "مزوّد محلي: المفتاح اختياري. تأكد أن الخادم يشتغل (مثلا فـ Termux)."
+                else -> "ما عليك إلا مفتاح API — العنوان جاهز. بعد إدخاله اضغط «اختيار» لتشوف كل موديلات المزوّد."
+            }
+        }
+        fun store(id: String) {
+            prefs.setKeyFor(id, key.text.toString().trim())
+            prefs.setModelFor(id, model.text.toString().trim())
+            prefs.setBaseFor(id, base.text.toString().trim())
+        }
+
+        val providerSel = selector(a, p, "المزوّد", labels, ids.indexOf(cur)) { idx ->
+            store(cur)
+            cur = ids[idx]
+            load(cur)
+        }
+
+        // ---- المفتاح + إظهار/إخفاء
+        var reveal = false
+        val eye = TextView(a).apply {
+            text = "إظهار"; setTextColor(p.accent); textSize = 13f; gravity = Gravity.CENTER
+            setPadding(dp(a, 14), dp(a, 8), dp(a, 6), dp(a, 8))
+            isClickable = true; isFocusable = true
+            setOnClickListener {
+                reveal = !reveal
+                val pos = key.selectionStart.coerceAtLeast(0)
+                key.inputType = InputType.TYPE_CLASS_TEXT or
+                    (if (reveal) InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD else InputType.TYPE_TEXT_VARIATION_PASSWORD)
+                key.setSelection(pos.coerceAtMost(key.text.length))
+                text = if (reveal) "إخفاء" else "إظهار"
+            }
+        }
+        val keyRow = LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(key, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(eye, LinearLayout.LayoutParams(WRAP, WRAP))
+        }
+
+        // ---- الموديل + جلب اللائحة
+        fun fetchModels() {
+            store(cur)
+            prefs.provider = cur
+            val id = cur
+            toast("⏳ جارٍ جلب الموديلات…")
+            Thread {
+                val res = runCatching { AiClient.listModels(prefs) }
+                a.runOnUiThread {
+                    val found = res.getOrNull()
+                    val fallback = AiProviders.get(id)?.fallback.orEmpty()
+                    when {
+                        found != null && found.isNotEmpty() -> pickModel(a, p, found) { model.setText(it) }
+                        fallback.isNotEmpty() -> pickModel(a, p, fallback) { model.setText(it) }
+                        res.isFailure -> toast("تعذّر جلب الموديلات: " + (res.exceptionOrNull()?.message ?: ""), true)
+                        else -> toast("ما لقيتش موديلات — اكتب الاسم يدويا", true)
+                    }
+                }
+            }.start()
+        }
+        val pick = materialButton(a, p, "اختيار", false) { fetchModels() }
+        val modelRow = LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(model, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(pick, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = dp(a, 8) })
+        }
+
+        // ---- السلوك والمظهر
         val modes = listOf("تلقائي — ينفّذ مباشرة", "اسأل قبل كل تعديل")
-        val provider = spinner(a, p, AiPrefs.PROVIDERS, prefs.provider)
-        val model = field("فارغ = الموديل الافتراضي", prefs.model)
-        val key = field("API Key", prefs.apiKey, pass = true)
-        val base = field("اختياري (ضروري مع custom)", prefs.baseUrl)
-        val mode = spinner(a, p, modes, if (prefs.askBeforeEdit) modes[1] else modes[0])
-        val theme = spinner(a, p, AiPrefs.THEMES, prefs.theme)
+        val modeSel = selector(a, p, "وضع التنفيذ", modes, if (prefs.askBeforeEdit) 1 else 0) { }
+        val workspace = field("/storage/emulated/0/Documents/Android_Projects", prefs.workspace)
+        val themeIds = AiPrefs.THEMES
+        val themeSel = selector(a, p, "المظهر", listOf("تلقائي (حسب النظام)", "فاتح", "داكن"), themeIds.indexOf(prefs.theme)) { }
 
         fun save() {
-            prefs.provider = provider.selectedItem.toString()
-            prefs.model = model.text.toString().trim()
-            prefs.apiKey = key.text.toString().trim()
-            prefs.baseUrl = base.text.toString().trim()
-            prefs.askBeforeEdit = mode.selectedItemPosition == 1
-            prefs.theme = theme.selectedItem.toString()
+            store(cur)
+            prefs.provider = cur
+            prefs.customName = cName.text.toString().trim()
+            prefs.customFormat = formats[cFormat.index.coerceIn(0, formats.size - 1)]
+            prefs.customAuthHeader = cAuthHeader.text.toString().trim()
+            prefs.customAuthPrefix = cAuthPrefix.text.toString()
+            prefs.customHeaders = cHeaders.text.toString().trim()
+            prefs.customChatPath = cPath.text.toString().trim()
+            prefs.askBeforeEdit = modeSel.index == 1
+            prefs.theme = themeIds[themeSel.index.coerceIn(0, themeIds.size - 1)]
+            prefs.workspace = workspace.text.toString().trim()
         }
 
-        val box = LinearLayout(a).apply {
+        // ---- المحتوى
+        val content = LinearLayout(a).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(a, 20), dp(a, 10), dp(a, 20), dp(a, 20))
-            background = sheetBackground(a, p)
+            setPadding(dp(a, 20), 0, dp(a, 20), dp(a, 16))
+            addView(section("المزوّد")); addView(providerSel.view); addView(providerNote)
+            addView(section("مفتاح API")); addView(keyRow)
+            addView(note("كيتخزّن محليا فجهازك فقط، ولكل مزوّد مفتاحو."))
+            addView(section("الموديل")); addView(modelRow)
+            addView(advToggle); addView(advanced)
+            addView(section("وضع التنفيذ")); addView(modeSel.view)
+            addView(note("الحذف وتنفيذ الأوامر (run) دائما يطلبان تأكيدا."))
+            addView(section("مجلد العمل (اختياري)")); addView(workspace)
+            addView(note("فارغ = مجلد المشروع المفتوح، وإلا AndroidIDEProjects. هنا كيتخلق المجلدات والمشاريع الجديدة."))
+            addView(section("المظهر")); addView(themeSel.view)
         }
-        box.addView(View(a).apply { background = shape(p.line, dp(a, 2).toFloat()) },
-            LinearLayout.LayoutParams(dp(a, 32), dp(a, 4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(a, 12) })
-        box.addView(TextView(a).apply {
-            text = "إعدادات المساعد"; setTextColor(p.text); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
-        })
-        box.addView(label("المزوّد")); box.addView(provider)
-        box.addView(label("الموديل")); box.addView(model)
-        box.addView(label("API Key (كيتخزّن محليا فجهازك فقط)")); box.addView(key)
-        box.addView(label("Base URL")); box.addView(base)
-        box.addView(label("وضع التنفيذ (الحذف دائما يطلب تأكيدا)")); box.addView(mode)
-        box.addView(label("المظهر")); box.addView(theme)
+        val scroll = NestedScrollView(a).apply {
+            addView(content)
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isNestedScrollingEnabled = true
+            setOnTouchListener { v, ev ->
+                if (ev.action == MotionEvent.ACTION_DOWN || ev.action == MotionEvent.ACTION_MOVE) {
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
+                }
+                false
+            }
+        }
 
-        val row = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(materialButton(a, p, "اختبار الاتصال", false) {
+        // ---- الأزرار (ثابتة تحت، ما كتتحركش مع السكرول)
+        val actions = LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(a, 20), dp(a, 12), dp(a, 20), dp(a, 16))
+        }
+        actions.addView(materialButton(a, p, "اختبار الاتصال", false) {
             save()
-            Toast.makeText(a, "⏳ كنجرب الاتصال…", Toast.LENGTH_SHORT).show()
+            toast("⏳ كنجرب الاتصال…")
             Thread {
-                val msg = try { AiClient.ping(prefs); "الاتصال ناجح" }
+                val msg = try { AiClient.ping(prefs); "الاتصال ناجح ✓" }
                 catch (t: Throwable) { "فشل الاتصال: ${t.message ?: t.javaClass.simpleName}" }
                 a.runOnUiThread { Toast.makeText(a, msg, Toast.LENGTH_LONG).show() }
             }.start()
         }, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginEnd = dp(a, 8) })
-        row.addView(materialButton(a, p, "حفظ", true) {
+        actions.addView(materialButton(a, p, "حفظ", true) {
             save()
-            Toast.makeText(a, "تم الحفظ", Toast.LENGTH_SHORT).show()
+            toast("تم الحفظ")
+            onChange?.invoke()
             dialog.dismiss()
         }, LinearLayout.LayoutParams(0, WRAP, 1f))
-        box.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(a, 20) })
 
-        val sc = ScrollView(a).apply { addView(box); isVerticalScrollBarEnabled = false }
-        setupSheet(a, dialog, sc, 96)
+        // ---- الهيكل
+        val head = LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(a, 20), dp(a, 4), dp(a, 8), 0)
+            addView(TextView(a).apply {
+                text = "إعدادات المساعد"; setTextColor(p.text); textSize = 18f; typeface = Typeface.DEFAULT_BOLD
+            }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(iconButton(a, "ic_ai_close", "إغلاق", p.sub, Color.TRANSPARENT, 42) { dialog.dismiss() },
+                LinearLayout.LayoutParams(dp(a, 42), dp(a, 42)))
+        }
+        val root = LinearLayout(a).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(a, 10), 0, 0)
+            background = sheetBackground(a, p)
+        }
+        root.addView(View(a).apply { background = shape(p.line, dp(a, 2).toFloat()) },
+            LinearLayout.LayoutParams(dp(a, 36), dp(a, 4)).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(a, 8) })
+        root.addView(head)
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        root.addView(View(a).apply { setBackgroundColor(p.line) }, LinearLayout.LayoutParams(MATCH, dp(a, 1)))
+        root.addView(actions)
+
+        load(cur)
+        setupSheet(a, dialog, root, 64)
         dialog.show()
     }
 
@@ -1391,9 +2110,13 @@ complete file content, raw (no code fence, no escaping)
 <tool name="move" path="from" to="to"/>
 <tool name="delete" path="file-or-dir"/>
 <tool name="search" query="text" path="dir"/>
+<tool name="run" dir="optional-dir">
+one shell command (runs in the workspace; the user must approve every command)
+</tool>
 
 ## Rules
-- Paths are relative to the workspace root, or absolute inside the projects folder (both given below).
+- Paths are relative to the workspace root, or absolute anywhere inside shared storage (/storage/emulated/0/...).
+- Always use double quotes for tag attributes, and write file content RAW inside the tag (never inside a ``` code fence).
 - To create a NEW project, use absolute paths under the projects folder and write every file the project needs
   (settings.gradle.kts, build.gradle.kts, app/build.gradle.kts, gradle.properties, AndroidManifest.xml,
   MainActivity, layouts/values). Tell the user once that the Gradle wrapper must be added/synced by the IDE.
@@ -1408,323 +2131,10 @@ complete file content, raw (no code fence, no escaping)
 - NEVER claim that you created or changed anything unless a <tool_results> block confirmed it. Do the work with tools first.
 - NEVER use the API's native function calling. Tools are ONLY the plain-text <tool .../> tags above.
 - After write/edit, if something may break (imports, manifest entries, dependencies), fix it in the same run.
-"""
+- If a tool fails, read the error, fix the cause and retry once with a corrected call. If it fails again, stop and tell the user why.
 
-    private fun buildSystem(ed: EditorAccess?, ws: AiAgent.Workspace): String = buildString {
-        appendLine(AGENT_RULES.trim())
-        appendLine("\n## Workspace root: ${ws.root.path}")
-        appendLine("## Projects folder: ${ws.projects.path}")
-        appendLine("\n## Files in workspace:")
-        val lines = mutableListOf<String>()
-        tree(ws.root, ws.root, 0, lines)
-        lines.forEach { appendLine("- $it") }
-        if (lines.isEmpty()) appendLine("(empty)")
-    }
-
-    private fun projectRoot(f: File?): File? {
-        val first = f?.parentFile
-        var d = first
-        while (d != null) {
-            if (File(d, "settings.gradle").exists() || File(d, "settings.gradle.kts").exists()) return d
-            d = d.parentFile
-        }
-        return first
-    }
-
-    private val skip = setOf("build", ".gradle", ".git", ".idea", ".cxx", ".kotlin", "node_modules")
-    private val skipExt = setOf(
-        "png", "jpg", "jpeg", "webp", "gif", "jar", "aar", "apk", "so", "zip",
-        "ttf", "otf", "mp3", "mp4", "class", "dex", "keystore", "jks"
-    )
-
-    private fun tree(root: File, dir: File, depth: Int, out: MutableList<String>) {
-        if (depth > 6 || out.size >= 100) return
-        dir.listFiles()?.sortedBy { it.name }?.forEach { f ->
-            if (out.size >= 100 || f.name in skip) return@forEach
-            if (f.isDirectory) tree(root, f, depth + 1, out)
-            else if (f.extension.lowercase() !in skipExt) out.add(f.relativeTo(root).path)
-        }
-    }
-}
-
-KT_EOF
-
-# ---------------------------------------------------------------- AiPlugin.kt
-cat > "$PKG_DIR/AiPlugin.kt" <<'KT_EOF'
-package com.itsaky.androidide.ai
-
-import android.app.Activity
-import android.app.Application
-import android.content.Context
-import android.content.res.ColorStateList
-import android.os.Bundle
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
-import android.view.ViewGroup
-import android.graphics.Rect
-import android.widget.FrameLayout
-import com.google.android.material.floatingactionbutton.FloatingActionButton
-import org.json.JSONArray
-import org.json.JSONObject
-import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.math.abs
-
-/** نقطة الدخول: كتتسجل مرة وحدة من Application.onCreate وكتحط زر AI عائم (Material FAB) فشاشة المحرر. */
-object AiPlugin {
-
-    private const val MAX_HISTORY = 80
-
-    @Volatile private var installed = false
-    val history: MutableList<AiClient.Msg> = CopyOnWriteArrayList()
-
-    @JvmStatic
-    fun install(app: Application) {
-        if (installed) return
-        installed = true
-        load(app)
-        app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-            override fun onActivityResumed(a: Activity) { if (a.javaClass.simpleName.contains("Editor")) attachFab(a) }
-            override fun onActivityCreated(a: Activity, s: Bundle?) {}
-            override fun onActivityStarted(a: Activity) {}
-            override fun onActivityPaused(a: Activity) {}
-            override fun onActivityStopped(a: Activity) {}
-            override fun onActivitySaveInstanceState(a: Activity, o: Bundle) {}
-            override fun onActivityDestroyed(a: Activity) {}
-        })
-    }
-
-    // ------------------------------------------------------------ history persistence
-    fun load(ctx: Context) {
-        try {
-            val raw = AiPrefs(ctx).history
-            if (raw.isBlank()) return
-            val arr = JSONArray(raw)
-            history.clear()
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                history.add(AiClient.Msg(o.getString("role"), o.getString("content")))
-            }
-        } catch (t: Throwable) { /* سجل تالف: نتجاهله */ }
-    }
-
-    fun save(ctx: Context) {
-        try {
-            while (history.size > MAX_HISTORY) history.removeAt(0)
-            val arr = JSONArray()
-            history.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
-            AiPrefs(ctx).history = arr.toString()
-        } catch (t: Throwable) { /* ما نكسرو التطبيق بسبب الحفظ */ }
-    }
-
-    // ------------------------------------------------------------ floating button
-    private fun attachFab(a: Activity) {
-        val content = a.findViewById<ViewGroup>(android.R.id.content) ?: return
-        if (content.findViewWithTag<View>("ai_fab") != null) return
-        try {
-            val d = a.resources.displayMetrics.density
-            val st = AiChat.fabStyle(a)
-            // FloatingActionButton من Material: يأخذ شكل وظلال وحركة التطبيق تلقائيا
-            val fab = FloatingActionButton(a).apply {
-                tag = "ai_fab"
-                contentDescription = "مساعد الذكاء الاصطناعي"
-                backgroundTintList = ColorStateList.valueOf(st[0])
-                imageTintList = ColorStateList.valueOf(st[1])
-                setImageDrawable(AiChat.icon(a, "ic_ai_sparkle"))
-            }
-            val lp = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.END
-            ).apply {
-                bottomMargin = (110 * d).toInt()
-                marginEnd = (16 * d).toInt()
-            }
-            content.addView(fab, lp)
-
-            // لو كاين FAB آخر ظاهر فالشاشة (مثل أزرار لوحة السجلات) نخبّيو الزر ديالنا باش ما يتداخلوش
-            val check = Runnable {
-                val hide = otherFabOnScreen(content, fab)
-                val want = if (hide) View.GONE else View.VISIBLE
-                if (fab.visibility != want) fab.visibility = want
-            }
-            content.viewTreeObserver.addOnGlobalLayoutListener {
-                content.removeCallbacks(check)
-                content.postDelayed(check, 120)
-            }
-
-            // سحب الزر + ضغطة قصيرة تفتح الشات + يلصق مع أقرب حافة
-            var sx = 0f; var sy = 0f; var tx = 0f; var ty = 0f; var moved = false
-            fab.setOnTouchListener { v, e ->
-                when (e.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        sx = e.rawX; sy = e.rawY; tx = v.translationX; ty = v.translationY; moved = false
-                        v.animate().scaleX(0.92f).scaleY(0.92f).setDuration(80).start()
-                        true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        val mx = e.rawX - sx; val my = e.rawY - sy
-                        if (abs(mx) > 12 * d || abs(my) > 12 * d) moved = true
-                        if (moved) { v.translationX = tx + mx; v.translationY = ty + my }
-                        true
-                    }
-                    MotionEvent.ACTION_UP -> {
-                        v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
-                        if (!moved) {
-                            AiChat.show(a)
-                        } else {
-                            val pw = content.width.toFloat()
-                            val ph = content.height.toFloat()
-                            val left = v.left.toFloat()
-                            val top = v.top.toFloat()
-                            val cx = left + v.translationX + v.width / 2f
-                            val edge = 8 * d
-                            val targetX = if (cx < pw / 2f) edge else pw - v.width - edge
-                            val targetY = (top + v.translationY).coerceIn(edge, (ph - v.height - edge).coerceAtLeast(edge))
-                            v.animate().translationX(targetX - left).translationY(targetY - top).setDuration(180).start()
-                        }
-                        true
-                    }
-                    MotionEvent.ACTION_CANCEL -> {
-                        v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
-                        true
-                    }
-                    else -> false
-                }
-            }
-        } catch (t: Throwable) { /* ما نكسرو شاشة المحرر إلا وقع مشكل فالـ theme */ }
-    }
-
-    private fun otherFabOnScreen(x: View, self: View): Boolean {
-        if (x === self || x.visibility != View.VISIBLE) return false
-        if (x.javaClass.name.contains("FloatingActionButton") && x.isShown && x.getGlobalVisibleRect(Rect())) return true
-        if (x is ViewGroup) for (i in 0 until x.childCount) if (otherFabOnScreen(x.getChildAt(i), self)) return true
-        return false
-    }
-}
-
-KT_EOF
-
-# ---------------------------------------------------------------- أيقونات vector + keep (للـ release)
-RES="$APP/src/main/res"
-mkdir -p "$RES/drawable" "$RES/raw"
-mkicon() { # name pathData
-  cat > "$RES/drawable/$1.xml" <<ICON_EOF
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="24dp" android:height="24dp"
-    android:viewportWidth="24" android:viewportHeight="24">
-    <path android:fillColor="#FFFFFFFF" android:pathData="$2"/>
-</vector>
-ICON_EOF
-}
-mkicon ic_ai_sparkle "M12,2l2.4,6.6L21,11l-6.6,2.4L12,20l-2.4,-6.6L3,11l6.6,-2.4zM19,16l0.9,2.1L22,19l-2.1,0.9L19,22l-0.9,-2.1L16,19l2.1,-0.9z"
-mkicon ic_ai_send "M2.01,21L23,12L2.01,3L2,10l15,2l-15,2z"
-mkicon ic_ai_stop "M7,7h10v10H7z"
-mkicon ic_ai_close "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12z"
-mkicon ic_ai_more "M12,8c1.1,0 2,-0.9 2,-2s-0.9,-2 -2,-2s-2,0.9 -2,2s0.9,2 2,2zM12,10c-1.1,0 -2,0.9 -2,2s0.9,2 2,2s2,-0.9 2,-2s-0.9,-2 -2,-2zM12,16c-1.1,0 -2,0.9 -2,2s0.9,2 2,2s2,-0.9 2,-2s-0.9,-2 -2,-2z"
-cat > "$RES/raw/ai_keep.xml" <<'KEEP_EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<resources xmlns:tools="http://schemas.android.com/tools"
-    tools:keep="@drawable/ic_ai_*" />
-KEEP_EOF
-
-# ---------------------------------------------------------------- إزالة LeakCanary (تطبيق "Leaks")
-echo "🧹 كنقلّب على LeakCanary..."
-LC_USES="$(grep -rIl -i 'leakcanary' "$ROOT" --include='*.kt' --include='*.java' --include='*.xml' \
-  --exclude-dir=build --exclude-dir=.git --exclude-dir=.gradle 2>/dev/null \
-  | grep -v '/src/debug/res/values/leakcanary_config.xml' || true)"
-LC_BLD="$(grep -rIl -i 'leakcanary' "$ROOT" --include='*.kts' --include='*.gradle' --include='*.toml' \
-  --exclude-dir=build --exclude-dir=.git --exclude-dir=.gradle 2>/dev/null || true)"
-if [ -z "$LC_USES" ] && [ -n "$LC_BLD" ]; then
-  for f in $LC_BLD; do
-    [ -f "$f.ai-bak" ] || cp "$f" "$f.ai-bak"
-    sed -i '/leakcanary/Id' "$f"
-    echo "🗑️  حيّدت LeakCanary من $f"
-  done
-else
-  if [ -n "$LC_USES" ]; then
-    echo "⚠️ LeakCanary مستعمل فالكود، غنخبّي الأيقونة فقط:"; echo "$LC_USES"
-  fi
-  LCD="$APP/src/debug/res/values"; mkdir -p "$LCD"
-  printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<resources>' \
-    '    <bool name="leak_canary_add_launcher_icon">false</bool>' '</resources>' > "$LCD/leakcanary_config.xml"
-fi
-
-# ---------------------------------------------------------------- patch Application + Manifest
-python3 - "$ROOT" "$NEW_APPID" <<'PY_EOF'
-import re, sys, os, pathlib
-
-root = pathlib.Path(sys.argv[1])
-app_dir = pathlib.Path(os.environ["APP_DIR"])
-src = app_dir / "src"
-MARK = "com.itsaky.androidide.ai.AiPlugin"
-
-# 1) Application class ------------------------------------------------------
-cands = []
-for p in src.rglob("*"):
-    if p.suffix not in (".kt", ".java") or "/ai/" in str(p):
-        continue
-    t = p.read_text(errors="ignore")
-    if re.search(r":\s*\w*Application\w*\s*\(\)|extends\s+\w*Application\b", t) and "onCreate" in t:
-        cands.append((p, t))
-
-cands.sort(key=lambda c: (0 if "IDEApplication" in c[0].name else 1, str(c[0])))
-if not cands:
-    print("⚠️  ما لقيتش كلاس Application. زيد هاد السطر يدويا فـ Application.onCreate():")
-    print("    com.itsaky.androidide.ai.AiPlugin.install(this)")
-else:
-    p, t = cands[0]
-    if MARK in t:
-        print(f"ℹ️  {p.name} مبدّل من قبل")
-    else:
-        is_kt = p.suffix == ".kt"
-        m = re.search(r"(override\s+fun\s+onCreate\s*\(\s*\)\s*\{|void\s+onCreate\s*\(\s*\)\s*\{)", t)
-        if not m:
-            print(f"⚠️  ما لقيتش onCreate() فـ {p}. زيد السطر يدويا.")
-        else:
-            sup = re.compile(r"super\.onCreate\(\)[ \t]*;?").search(t, m.end())
-            pos = sup.end() if sup else m.end()
-            snippet = (
-                "\n        runCatching { com.itsaky.androidide.ai.AiPlugin.install(this) }"
-                if is_kt else
-                "\n        try { com.itsaky.androidide.ai.AiPlugin.install(this); } catch (Throwable ignored) {}"
-            )
-            (p.parent / (p.name + ".ai-bak")).write_text(t)
-            p.write_text(t[:pos] + snippet + t[pos:])
-            print(f"✅ بدّلت {p.relative_to(root)}")
-
-# 3) applicationId (اختياري) -------------------------------------------------
-new_id = sys.argv[2] if len(sys.argv) > 2 else ""
-if new_id:
-    for name in ("build.gradle.kts", "build.gradle"):
-        g = app_dir / name
-        if g.exists():
-            t = g.read_text()
-            m = re.search(r'applicationId\s*=?\s*["\']([^"\']+)["\']', t)
-            if not m:
-                print(f"⚠️  ما لقيتش applicationId فـ {name} (يمكن كيجي من BuildConfig/convention plugin)")
-            else:
-                (g.parent / (name + ".ai-bak")).write_text(t)
-                t = t[:m.start(1)] + new_id + t[m.end(1):]
-                g.write_text(t)
-                print(f"✅ applicationId: {m.group(1)} → {new_id}")
-            break
-
-# 2) INTERNET permission -----------------------------------------------------
-mf = src / "main" / "AndroidManifest.xml"
-if mf.exists():
-    t = mf.read_text()
-    if "android.permission.INTERNET" in t:
-        print("ℹ️  صلاحية INTERNET موجودة")
-    else:
-        (mf.parent / "AndroidManifest.xml.ai-bak").write_text(t)
-        t = re.sub(r"(<manifest[^>]*>)",
-                   r'\1\n    <uses-permission android:name="android.permission.INTERNET"/>', t, count=1)
-        mf.write_text(t)
-        print("✅ زدت صلاحية INTERNET")
-PY_EOF
-
-echo
-echo "✅ تمّ الحقن. دابا بني التطبيق:"
-rel="${APP#"$ROOT"/}"; GPATH=":${rel//\//:}"
-echo "   cd $ROOT && ./gradlew ${GPATH}:assembleDebug"
-echo "   (للتراجع: bash inject-ai.sh $ROOT undo)"
+## Building things (IMPORTANT)
+- When the user asks to create a folder, file, screen, UI or project: DO IT NOW with create_dir + write_file. Never answer with instructions only.
+- "Create a folder X and put Y in it" means: create_dir X, then write_file X/<files>. Use the workspace root unless the user gives another path.
+- For a screen/UI in an Android project: write the XML layout (res/layout), its Activity or Fragment, any strings/colors/styles it needs,
+  and register a new Activity in AndroidManifest.xm
