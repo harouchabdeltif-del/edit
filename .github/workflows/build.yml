@@ -171,6 +171,21 @@ jobs:
           ./gradlew :core:app:assembleDebug -x :core:app:validateSigningDebug \
             --no-daemon --console=plain 2>&1 | tee build.log
 
+      # تشخيص: واش الـ bootstrap تصحّح فعلا؟ (كيطبع محتوى sources.list من كل zip)
+      - name: Verify bootstrap patch
+        if: always()
+        run: |
+          cd AndroidIDE
+          echo "===== PATCHED lines in build.log ====="
+          grep -n "PATCHED\|bootstrap zips found\|patched:" build.log | head -20 || true
+          echo "===== bootstrap-related tasks ====="
+          grep -n -i "bootstrap" build.log | head -15 || true
+          echo "===== bootstrap zips on disk ====="
+          find . -name 'bootstrap-*.zip' -not -path './.git/*' | while read -r z; do
+            echo "== $z"
+            unzip -p "$z" etc/apt/sources.list 2>/dev/null || echo "(no etc/apt/sources.list)"
+          done
+
       # ملخص قصير للخطأ فآخر الـ log (باش ما تحتاجش تسكرول فالهاتف)
       - name: Show build errors
         if: failure()
